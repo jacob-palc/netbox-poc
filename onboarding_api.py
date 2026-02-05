@@ -130,6 +130,25 @@ def onboard_device():
         password = data.get('password', '')
         skip_ping = data.get('skip_ping', False)
 
+        # Step 0: Check if IP address is already assigned to a device
+        existing_ip = requests.get(
+            f"{NETBOX_URL}/api/ipam/ip-addresses/",
+            headers=HEADERS,
+            params={'address': ip_address}
+        )
+        if existing_ip.status_code == 200 and existing_ip.json()['count'] > 0:
+            ip_data = existing_ip.json()['results'][0]
+            # Check if IP is assigned to an interface (which means it's linked to a device)
+            if ip_data.get('assigned_object'):
+                assigned_obj = ip_data['assigned_object']
+                device_name_existing = assigned_obj.get('device', {}).get('name', 'Unknown')
+                return jsonify({
+                    'error': 'IP address already in use',
+                    'message': f"IP {ip_address} is already assigned to device '{device_name_existing}'",
+                    'existing_device': device_name_existing,
+                    'existing_ip_id': ip_data['id']
+                }), 409  # 409 Conflict
+
         # Generate device name if not provided
         device_name = data.get('name')
         if not device_name:
