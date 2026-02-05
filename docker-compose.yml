@@ -57,12 +57,21 @@ services:
       SUPERUSER_API_TOKEN: 0123456789abcdef0123456789abcdef01234567
       # Device encryption key for onboarding
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
+      # Server2 NMS Validation (validates SSH before telemetry config)
+      SERVER2_VALIDATION_ENABLED: "true"
+      SERVER2_BASE_URL: "http://10.4.160.240:8081"
+      SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
+      SERVER2_DEVICE_ENDPOINT: "/device"
+      SERVER2_USERNAME: "admin"
+      SERVER2_PASSWORD: "admin"
       # Skip startup scripts that might fail
       SKIP_SUPERUSER: "false"
     ports:
       - "8000:8080"
     volumes:
       - ./netbox/scripts:/opt/netbox/netbox/scripts:ro
+      - ./netbox/extras/server2_client.py:/opt/netbox/netbox/extras/server2_client.py:ro
+      - ./netbox/extras/webhooks.py:/opt/netbox/netbox/extras/webhooks.py:ro
       - netbox-media-files:/opt/netbox/netbox/media
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/login/"]
@@ -89,6 +98,16 @@ services:
       REDIS_DATABASE: 0
       SECRET_KEY: "netbox-test-secret-key-change-in-production-at-least-50-chars"
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
+      # Server2 NMS Validation
+      SERVER2_VALIDATION_ENABLED: "true"
+      SERVER2_BASE_URL: "http://10.4.160.240:8081"
+      SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
+      SERVER2_DEVICE_ENDPOINT: "/device"
+      SERVER2_USERNAME: "admin"
+      SERVER2_PASSWORD: "admin"
+    volumes:
+      - ./netbox/extras/server2_client.py:/opt/netbox/netbox/extras/server2_client.py:ro
+      - ./netbox/extras/webhooks.py:/opt/netbox/netbox/extras/webhooks.py:ro
 
   # Mock Telemetry Service (to test webhooks)
   telemetry-mock:
