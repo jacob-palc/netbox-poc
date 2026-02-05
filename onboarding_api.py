@@ -185,13 +185,39 @@ def onboard_device():
 
         device_id = device_response.json()['id']
 
-        # Step 4: Create IP address
+        # Step 4: Create a management interface for the device
+        interface_payload = {
+            'device': device_id,
+            'name': 'mgmt0',
+            'type': 'virtual',
+            'description': 'Management interface'
+        }
+
+        interface_response = requests.post(
+            f"{NETBOX_URL}/api/dcim/interfaces/",
+            headers=HEADERS,
+            json=interface_payload
+        )
+
+        interface_id = None
+        if interface_response.status_code in [200, 201]:
+            interface_id = interface_response.json()['id']
+            print(f"Created interface mgmt0 for device {device_name}")
+        else:
+            print(f"Failed to create interface: {interface_response.status_code} - {interface_response.text}")
+
+        # Step 5: Create IP address and assign to interface
         ip_payload = {
             'address': f"{ip_address}/32",
             'status': 'active',
             'dns_name': device_name,
             'description': f'Management IP for {device_name}'
         }
+
+        # Assign IP to interface if we have one
+        if interface_id:
+            ip_payload['assigned_object_type'] = 'dcim.interface'
+            ip_payload['assigned_object_id'] = interface_id
 
         ip_response = requests.post(
             f"{NETBOX_URL}/api/ipam/ip-addresses/",
@@ -202,6 +228,7 @@ def onboard_device():
         ip_id = None
         if ip_response.status_code in [200, 201]:
             ip_id = ip_response.json()['id']
+            print(f"Created IP {ip_address} and assigned to interface")
         else:
             # IP might already exist, try to find it
             find_ip = requests.get(
@@ -211,16 +238,32 @@ def onboard_device():
             )
             if find_ip.status_code == 200 and find_ip.json()['count'] > 0:
                 ip_id = find_ip.json()['results'][0]['id']
+                # Update existing IP to assign to our interface
+                if interface_id:
+                    requests.patch(
+                        f"{NETBOX_URL}/api/ipam/ip-addresses/{ip_id}/",
+                        headers=HEADERS,
+                        json={
+                            'assigned_object_type': 'dcim.interface',
+                            'assigned_object_id': interface_id
+                        }
+                    )
 
-        # Step 5: Assign IP to device as primary
+        # Step 6: Set IP as primary for device
+        ip_assigned = False
         if ip_id:
             assign_response = requests.patch(
                 f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
                 headers=HEADERS,
                 json={'primary_ip4': ip_id}
             )
+            if assign_response.status_code == 200:
+                ip_assigned = True
+                print(f"IP {ip_address} set as primary IP for device {device_name}")
+            else:
+                print(f"Failed to set primary IP: {assign_response.status_code} - {assign_response.text}")
 
-        # Step 6: Update custom fields (if they exist)
+        # Step 7: Update custom fields (if they exist)
         custom_fields = {}
         if username:
             custom_fields['onboarding_username'] = username
@@ -251,6 +294,7 @@ def onboard_device():
                 'device_name': device_name,
                 'ip_address': ip_address,
                 'ip_id': ip_id,
+                'ip_assigned': ip_assigned,
                 'reachable': reachable_state,
                 'latency_ms': latency_ms,
                 'device_type': device_type_id,
