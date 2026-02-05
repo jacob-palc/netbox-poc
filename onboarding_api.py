@@ -118,8 +118,7 @@ def onboard_device():
         "site": 1,                    # Optional - defaults to 1
         "username": "admin",          # Optional - for custom fields
         "password": "secret123",      # Optional - will be encrypted
-        "skip_ping": true,            # Optional - skip ping (default: true for fast onboarding)
-        "fast_mode": true             # Optional - skip validation checks (default: true for speed)
+        "turbo_mode": true            # Optional - fastest mode, 3 API calls only (default: true)
     }
     """
     try:
@@ -139,15 +138,92 @@ def onboard_device():
         site_id = data.get('site', 1)
         username = data.get('username', '')
         password = data.get('password', '')
-        skip_ping = data.get('skip_ping', True)
-        fast_mode = data.get('fast_mode', True)  # Skip validation by default for speed
+        turbo_mode = data.get('turbo_mode', True)  # Fastest mode by default
 
         # Use IP address as device name if not provided
         device_name = data.get('name') or ip_address
 
-        # Validation checks (only if not in fast_mode)
-        if not fast_mode:
-            # Run validation checks in parallel
+        # Encrypt password (fast operation)
+        encrypted_password = encrypt_password(password) if password else ''
+
+        # Prepare custom fields
+        custom_fields = {
+            'onboarding_status': 'success',
+            'device_source': 'manual',
+            'last_onboarded': datetime.now().isoformat()
+        }
+        if username:
+            custom_fields['onboarding_username'] = username
+        if encrypted_password:
+            custom_fields['onboarding_password'] = encrypted_password
+
+        # TURBO MODE: 4 API calls with connection pooling, no validation
+        if turbo_mode:
+            # Step 1: Create device with custom fields (saves 1 API call)
+            device_response = session.post(
+                f"{NETBOX_URL}/api/dcim/devices/",
+                json={
+                    'name': device_name,
+                    'device_type': device_type_id,
+                    'role': role_id,
+                    'site': site_id,
+                    'status': 'active',
+                    'custom_fields': custom_fields
+                }
+            )
+
+            if device_response.status_code not in [200, 201]:
+                return jsonify({
+                    'error': 'Failed to create device',
+                    'details': device_response.text
+                }), 500
+
+            device_id = device_response.json()['id']
+
+            # Step 2: Create interface
+            interface_response = session.post(
+                f"{NETBOX_URL}/api/dcim/interfaces/",
+                json={
+                    'device': device_id,
+                    'name': 'mgmt0',
+                    'type': 'virtual'
+                }
+            )
+
+            interface_id = None
+            if interface_response.status_code in [200, 201]:
+                interface_id = interface_response.json()['id']
+
+            # Step 3: Create IP assigned to interface
+            ip_payload = {
+                'address': f"{ip_address}/32",
+                'status': 'active'
+            }
+            if interface_id:
+                ip_payload['assigned_object_type'] = 'dcim.interface'
+                ip_payload['assigned_object_id'] = interface_id
+
+            ip_response = session.post(
+                f"{NETBOX_URL}/api/ipam/ip-addresses/",
+                json=ip_payload
+            )
+
+            ip_id = None
+            if ip_response.status_code in [200, 201]:
+                ip_id = ip_response.json()['id']
+
+            # Step 4: Set primary IP (custom fields already set in step 1)
+            ip_assigned = False
+            if ip_id:
+                assign_response = session.patch(
+                    f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+                    json={'primary_ip4': ip_id}
+                )
+                ip_assigned = assign_response.status_code == 200
+
+        else:
+            # NORMAL MODE: With validation (slower but safer)
+            # Check for duplicates in parallel
             def check_ip():
                 return session.get(
                     f"{NETBOX_URL}/api/ipam/ip-addresses/",
@@ -168,12 +244,8 @@ def onboard_device():
                 if existing_ip.status_code == 200 and existing_ip.json()['count'] > 0:
                     ip_data = existing_ip.json()['results'][0]
                     if ip_data.get('assigned_object'):
-                        assigned_obj = ip_data['assigned_object']
-                        device_name_existing = assigned_obj.get('device', {}).get('name', 'Unknown')
                         return jsonify({
                             'error': 'IP address already in use',
-                            'message': f"IP {ip_address} is already assigned to device '{device_name_existing}'",
-                            'existing_device': device_name_existing,
                             'existing_ip_id': ip_data['id']
                         }), 409
 
@@ -181,89 +253,67 @@ def onboard_device():
                 if check_response.status_code == 200 and check_response.json()['count'] > 0:
                     device_name = f"{device_name}-{check_response.json()['count'] + 1}"
 
-        # Encrypt password (fast operation)
-        encrypted_password = encrypt_password(password) if password else ''
-
-        # Step 1: Create device
-        device_payload = {
-            'name': device_name,
-            'device_type': device_type_id,
-            'role': role_id,
-            'site': site_id,
-            'status': 'active'
-        }
-
-        device_response = session.post(
-            f"{NETBOX_URL}/api/dcim/devices/",
-            json=device_payload
-        )
-
-        if device_response.status_code not in [200, 201]:
-            return jsonify({
-                'error': 'Failed to create device',
-                'details': device_response.text
-            }), 500
-
-        device_id = device_response.json()['id']
-
-        # Step 2: Create interface
-        interface_response = session.post(
-            f"{NETBOX_URL}/api/dcim/interfaces/",
-            json={
-                'device': device_id,
-                'name': 'mgmt0',
-                'type': 'virtual',
-                'description': 'Management interface'
-            }
-        )
-
-        interface_id = None
-        if interface_response.status_code in [200, 201]:
-            interface_id = interface_response.json()['id']
-
-        # Step 3: Create IP address and assign to interface
-        ip_payload = {
-            'address': f"{ip_address}/32",
-            'status': 'active',
-            'dns_name': device_name,
-            'description': f'Management IP for {device_name}'
-        }
-        if interface_id:
-            ip_payload['assigned_object_type'] = 'dcim.interface'
-            ip_payload['assigned_object_id'] = interface_id
-
-        ip_response = session.post(
-            f"{NETBOX_URL}/api/ipam/ip-addresses/",
-            json=ip_payload
-        )
-
-        ip_id = None
-        if ip_response.status_code in [200, 201]:
-            ip_id = ip_response.json()['id']
-
-        # Step 4: Set primary IP AND custom fields in ONE call (saves ~500ms)
-        ip_assigned = False
-        if ip_id:
-            custom_fields = {
-                'onboarding_status': 'success',
-                'device_source': 'manual',
-                'last_onboarded': datetime.now().isoformat()
-            }
-            if username:
-                custom_fields['onboarding_username'] = username
-            if encrypted_password:
-                custom_fields['onboarding_password'] = encrypted_password
-
-            update_payload = {
-                'primary_ip4': ip_id,
-                'custom_fields': custom_fields
-            }
-
-            assign_response = session.patch(
-                f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
-                json=update_payload
+            # Create device
+            device_response = session.post(
+                f"{NETBOX_URL}/api/dcim/devices/",
+                json={
+                    'name': device_name,
+                    'device_type': device_type_id,
+                    'role': role_id,
+                    'site': site_id,
+                    'status': 'active',
+                    'custom_fields': custom_fields
+                }
             )
-            ip_assigned = assign_response.status_code == 200
+
+            if device_response.status_code not in [200, 201]:
+                return jsonify({
+                    'error': 'Failed to create device',
+                    'details': device_response.text
+                }), 500
+
+            device_id = device_response.json()['id']
+
+            # Create interface
+            interface_response = session.post(
+                f"{NETBOX_URL}/api/dcim/interfaces/",
+                json={
+                    'device': device_id,
+                    'name': 'mgmt0',
+                    'type': 'virtual'
+                }
+            )
+
+            interface_id = None
+            if interface_response.status_code in [200, 201]:
+                interface_id = interface_response.json()['id']
+
+            # Create IP
+            ip_payload = {
+                'address': f"{ip_address}/32",
+                'status': 'active'
+            }
+            if interface_id:
+                ip_payload['assigned_object_type'] = 'dcim.interface'
+                ip_payload['assigned_object_id'] = interface_id
+
+            ip_response = session.post(
+                f"{NETBOX_URL}/api/ipam/ip-addresses/",
+                json=ip_payload
+            )
+
+            ip_id = None
+            if ip_response.status_code in [200, 201]:
+                ip_id = ip_response.json()['id']
+
+            # Set primary IP
+            ip_assigned = False
+            if ip_id:
+                assign_response = session.patch(
+                    f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+                    json={'primary_ip4': ip_id}
+                )
+                ip_assigned = assign_response.status_code == 200
 
         # Return success response
         return jsonify({
