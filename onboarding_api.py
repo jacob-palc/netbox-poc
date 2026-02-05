@@ -149,10 +149,10 @@ def onboard_device():
                     'existing_ip_id': ip_data['id']
                 }), 409  # 409 Conflict
 
-        # Generate device name if not provided
+        # Use IP address as device name if not provided
         device_name = data.get('name')
         if not device_name:
-            device_name = generate_device_name(ip_address)
+            device_name = ip_address
 
         # Check if device name already exists, add suffix if needed
         check_response = requests.get(
