@@ -159,18 +159,28 @@ def onboard_device():
 
         # TURBO MODE: 4 API calls with connection pooling, no validation
         if turbo_mode:
-            # Step 1: Create device with custom fields (saves 1 API call)
+            # Step 1: Create device (try with custom fields, fallback without)
+            device_payload = {
+                'name': device_name,
+                'device_type': device_type_id,
+                'role': role_id,
+                'site': site_id,
+                'status': 'active',
+                'custom_fields': custom_fields
+            }
+
             device_response = session.post(
                 f"{NETBOX_URL}/api/dcim/devices/",
-                json={
-                    'name': device_name,
-                    'device_type': device_type_id,
-                    'role': role_id,
-                    'site': site_id,
-                    'status': 'active',
-                    'custom_fields': custom_fields
-                }
+                json=device_payload
             )
+
+            # If custom fields fail, retry without them
+            if device_response.status_code not in [200, 201] and 'custom field' in device_response.text.lower():
+                del device_payload['custom_fields']
+                device_response = session.post(
+                    f"{NETBOX_URL}/api/dcim/devices/",
+                    json=device_payload
+                )
 
             if device_response.status_code not in [200, 201]:
                 return jsonify({
@@ -253,18 +263,28 @@ def onboard_device():
                 if check_response.status_code == 200 and check_response.json()['count'] > 0:
                     device_name = f"{device_name}-{check_response.json()['count'] + 1}"
 
-            # Create device
+            # Create device (try with custom fields, fallback without)
+            device_payload = {
+                'name': device_name,
+                'device_type': device_type_id,
+                'role': role_id,
+                'site': site_id,
+                'status': 'active',
+                'custom_fields': custom_fields
+            }
+
             device_response = session.post(
                 f"{NETBOX_URL}/api/dcim/devices/",
-                json={
-                    'name': device_name,
-                    'device_type': device_type_id,
-                    'role': role_id,
-                    'site': site_id,
-                    'status': 'active',
-                    'custom_fields': custom_fields
-                }
+                json=device_payload
             )
+
+            # If custom fields fail, retry without them
+            if device_response.status_code not in [200, 201] and 'custom field' in device_response.text.lower():
+                del device_payload['custom_fields']
+                device_response = session.post(
+                    f"{NETBOX_URL}/api/dcim/devices/",
+                    json=device_payload
+                )
 
             if device_response.status_code not in [200, 201]:
                 return jsonify({
