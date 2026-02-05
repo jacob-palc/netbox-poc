@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+# Install ping utility
+RUN apt-get update && apt-get install -y iputils-ping && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install requests
+
+COPY device_monitor.py /app/
+
+CMD ["python", "device_monitor.py"]

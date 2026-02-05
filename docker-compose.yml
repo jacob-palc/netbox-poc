@@ -116,6 +116,23 @@ services:
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
 
+  # Device Reachability Monitor (continuous ping monitoring)
+  device-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.device-monitor
+    container_name: device-monitor
+    depends_on:
+      netbox:
+        condition: service_healthy
+    environment:
+      NETBOX_URL: "http://netbox:8080"
+      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
+      PING_INTERVAL: "60"
+      PING_COUNT: "3"
+      PING_TIMEOUT: "2"
+    restart: unless-stopped
+
 volumes:
   netbox-postgres-data:
   netbox-redis-data:

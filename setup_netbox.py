@@ -128,6 +128,22 @@ class NetBoxSetup:
                 'weight': 150,
                 'choice_set': None,
                 'object_types': [f'dcim.device']
+            },
+            {
+                'name': 'last_reachability_check',
+                'type': 'datetime',
+                'label': 'Last Reachability Check',
+                'description': 'Timestamp of last ping check by monitor',
+                'weight': 160,
+                'object_types': [f'dcim.device']
+            },
+            {
+                'name': 'last_latency_ms',
+                'type': 'decimal',
+                'label': 'Last Latency (ms)',
+                'description': 'Last measured ping latency in milliseconds',
+                'weight': 170,
+                'object_types': [f'dcim.device']
             }
         ]
 
@@ -352,7 +368,7 @@ class NetBoxSetup:
             'http_content_type': 'application/json',
             'ssl_verification': False,  # For testing with mock service
             'body_template': '''{
-  "event": "device.onboarded",
+  "event": "device.{% if snapshots.prechange %}updated{% else %}onboarded{% endif %}",
   "timestamp": "{{ timestamp }}",
   "data": {
     "device_id": {{ data.id }},
@@ -369,7 +385,9 @@ class NetBoxSetup:
     "reachable_state": {% if data.custom_field_data.reachable_state is not none %}{{ data.custom_field_data.reachable_state|lower }}{% else %}null{% endif %},
     "device_source": "{{ data.custom_field_data.device_source }}",
     "last_onboarded": "{{ data.custom_field_data.last_onboarded }}",
-    "onboarding_status": "{{ data.custom_field_data.onboarding_status }}"
+    "onboarding_status": "{{ data.custom_field_data.onboarding_status }}",
+    "last_reachability_check": "{{ data.custom_field_data.last_reachability_check }}",
+    "last_latency_ms": {% if data.custom_field_data.last_latency_ms is not none %}{{ data.custom_field_data.last_latency_ms }}{% else %}null{% endif %}
   }
 }'''
         }
@@ -399,18 +417,19 @@ class NetBoxSetup:
             return None
 
     def create_event_rule(self, webhook_id):
-        """Create event rule to trigger webhook"""
-        print("\n--- Creating Event Rule ---")
+        """Create event rules to trigger webhook"""
+        print("\n--- Creating Event Rules ---")
 
         if not webhook_id:
-            print("  WARNING: Skipping event rule - no webhook ID")
+            print("  WARNING: Skipping event rules - no webhook ID")
             return None
 
-        event_rule_data = {
+        # Event rule 1: Device Onboarding (new devices with onboarding_status = success)
+        onboarding_rule = {
             'name': 'Device Onboarding Event',
             'enabled': True,
             'object_types': ['dcim.device'],
-            'event_types': ['object_created', 'object_updated'],
+            'event_types': ['object_created'],
             'action_type': 'webhook',
             'action_object_type': 'extras.webhook',
             'action_object_id': webhook_id,
@@ -421,29 +440,51 @@ class NetBoxSetup:
             }
         }
 
-        # Check if event rule exists
-        response = requests.get(
-            f"{self.api_url}/extras/event-rules/",
-            headers=self.headers,
-            params={'name': event_rule_data['name']}
-        )
-        if response.json()['count'] > 0:
-            rule_id = response.json()['results'][0]['id']
-            print(f"  Event rule '{event_rule_data['name']}' already exists (ID: {rule_id})")
-            return rule_id
+        # Event rule 2: Device Reachability Update (any device update with reachable_state set)
+        reachability_rule = {
+            'name': 'Device Reachability Update',
+            'enabled': True,
+            'object_types': ['dcim.device'],
+            'event_types': ['object_updated'],
+            'action_type': 'webhook',
+            'action_object_type': 'extras.webhook',
+            'action_object_id': webhook_id,
+            'conditions': {
+                'and': [
+                    {'attr': 'custom_field_data.last_reachability_check', 'negate': True, 'value': ''}
+                ]
+            }
+        }
 
-        response = requests.post(
-            f"{self.api_url}/extras/event-rules/",
-            headers=self.headers,
-            json=event_rule_data
-        )
-        if response.status_code in [200, 201]:
-            rule_id = response.json()['id']
-            print(f"  Created event rule: {event_rule_data['name']} (ID: {rule_id})")
-            return rule_id
-        else:
-            print(f"  WARNING: Failed to create event rule: {response.text}")
-            return None
+        rules = [onboarding_rule, reachability_rule]
+        created_ids = []
+
+        for rule_data in rules:
+            # Check if event rule exists
+            response = requests.get(
+                f"{self.api_url}/extras/event-rules/",
+                headers=self.headers,
+                params={'name': rule_data['name']}
+            )
+            if response.json()['count'] > 0:
+                rule_id = response.json()['results'][0]['id']
+                print(f"  Event rule '{rule_data['name']}' already exists (ID: {rule_id})")
+                created_ids.append(rule_id)
+                continue
+
+            response = requests.post(
+                f"{self.api_url}/extras/event-rules/",
+                headers=self.headers,
+                json=rule_data
+            )
+            if response.status_code in [200, 201]:
+                rule_id = response.json()['id']
+                print(f"  Created event rule: {rule_data['name']} (ID: {rule_id})")
+                created_ids.append(rule_id)
+            else:
+                print(f"  WARNING: Failed to create event rule '{rule_data['name']}': {response.text}")
+
+        return created_ids
 
     def run_setup(self):
         """Run complete setup"""
