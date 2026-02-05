@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install flask cryptography
+
+COPY telemetry_mock_service.py /app/
+
+EXPOSE 5000
+
+CMD ["python", "telemetry_mock_service.py"]
