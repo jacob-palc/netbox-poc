@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+Device Onboarding API Service
+
+A simple Flask API that wraps NetBox API calls to allow single-call device onboarding.
+Your NMS can call this endpoint with device details and IP address in one request.
+
+Usage:
+    python onboarding_api.py
+
+Endpoint:
+    POST /api/onboard
+    {
+        "name": "CPE-001",
+        "ip": "192.168.1.100",
+        "device_type": 1,
+        "role": 1,
+        "site": 1,
+        "username": "admin",
+        "password": "secret123"
+    }
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import subprocess
+import platform
+import re
+import os
+from datetime import datetime
+from cryptography.fernet import Fernet
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+NETBOX_URL = os.environ.get('NETBOX_URL', 'http://localhost:8000')
+NETBOX_TOKEN = os.environ.get('NETBOX_TOKEN', '0123456789abcdef0123456789abcdef01234567')
+ENCRYPTION_KEY = os.environ.get('NETBOX_DEVICE_ENCRYPTION_KEY', 'XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA=')
+
+HEADERS = {
+    'Authorization': f'Token {NETBOX_TOKEN}',
+    'Content-Type': 'application/json'
+}
+
+
+def encrypt_password(password):
+    """Encrypt password using Fernet"""
+    try:
+        key = ENCRYPTION_KEY
+        if isinstance(key, str):
+            key = key.encode()
+        cipher = Fernet(key)
+        return cipher.encrypt(password.encode()).decode()
+    except Exception as e:
+        return password  # Return plain if encryption fails
+
+
+def ping_device(ip_address, count=3, timeout=2):
+    """Ping device to check reachability"""
+    try:
+        system = platform.system().lower()
+
+        if system == 'windows':
+            cmd = ['ping', '-n', str(count), '-w', str(timeout * 1000), ip_address]
+        else:
+            cmd = ['ping', '-c', str(count), '-W', str(timeout), ip_address]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=count * timeout + 5)
+        is_reachable = result.returncode == 0
+
+        # Parse latency
+        output = result.stdout
+        latency_ms = None
+
+        if system == 'windows' and 'Average' in output:
+            match = re.search(r'Average\s*=\s*(\d+)ms', output)
+            if match:
+                latency_ms = float(match.group(1))
+        else:
+            match = re.search(r'min/avg/max.*?=\s*[\d.]+/([\d.]+)/', output)
+            if match:
+                latency_ms = float(match.group(1))
+
+        return is_reachable, latency_ms
+    except Exception:
+        return False, None
+
+
+def generate_device_name(ip_address, role_slug='cpe'):
+    """Generate device name from IP"""
+    ip_parts = ip_address.split('.')
+    return f"{role_slug.upper()}-{ip_parts[2]}-{ip_parts[3]}"
+
+
+@app.route('/api/onboard', methods=['POST'])
+def onboard_device():
+    """
+    Single endpoint to onboard a device with IP assignment
+
+    Request Body:
+    {
+        "name": "CPE-001",           # Optional - auto-generated if not provided
+        "ip": "192.168.1.100",        # Required
+        "device_type": 1,             # Required - NetBox device type ID
+        "role": 1,                    # Required - NetBox role ID
+        "site": 1,                    # Optional - defaults to 1
+        "username": "admin",          # Optional - for custom fields
+        "password": "secret123",      # Optional - will be encrypted
+        "skip_ping": false            # Optional - skip reachability check
+    }
+    """
+    try:
+        data = request.get_json()
+
+        # Validate required fields
+        if not data.get('ip'):
+            return jsonify({'error': 'IP address is required'}), 400
+        if not data.get('device_type'):
+            return jsonify({'error': 'device_type is required'}), 400
+        if not data.get('role'):
+            return jsonify({'error': 'role is required'}), 400
+
+        ip_address = data['ip']
+        device_type_id = data['device_type']
+        role_id = data['role']
+        site_id = data.get('site', 1)
+        username = data.get('username', '')
+        password = data.get('password', '')
+        skip_ping = data.get('skip_ping', False)
+
+        # Generate device name if not provided
+        device_name = data.get('name')
+        if not device_name:
+            device_name = generate_device_name(ip_address)
+
+        # Check if device name already exists, add suffix if needed
+        check_response = requests.get(
+            f"{NETBOX_URL}/api/dcim/devices/",
+            headers=HEADERS,
+            params={'name': device_name}
+        )
+        if check_response.status_code == 200 and check_response.json()['count'] > 0:
+            counter = 1
+            original_name = device_name
+            while check_response.json()['count'] > 0:
+                device_name = f"{original_name}-{counter}"
+                check_response = requests.get(
+                    f"{NETBOX_URL}/api/dcim/devices/",
+                    headers=HEADERS,
+                    params={'name': device_name}
+                )
+                counter += 1
+
+        # Step 1: Ping device (optional)
+        reachable_state = None
+        latency_ms = None
+        if not skip_ping:
+            reachable_state, latency_ms = ping_device(ip_address)
+
+        # Step 2: Encrypt password
+        encrypted_password = encrypt_password(password) if password else ''
+
+        # Step 3: Create device
+        device_payload = {
+            'name': device_name,
+            'device_type': device_type_id,
+            'role': role_id,
+            'site': site_id,
+            'status': 'active'
+        }
+
+        device_response = requests.post(
+            f"{NETBOX_URL}/api/dcim/devices/",
+            headers=HEADERS,
+            json=device_payload
+        )
+
+        if device_response.status_code not in [200, 201]:
+            return jsonify({
+                'error': 'Failed to create device',
+                'details': device_response.text
+            }), 500
+
+        device_id = device_response.json()['id']
+
+        # Step 4: Create IP address
+        ip_payload = {
+            'address': f"{ip_address}/32",
+            'status': 'active',
+            'dns_name': device_name,
+            'description': f'Management IP for {device_name}'
+        }
+
+        ip_response = requests.post(
+            f"{NETBOX_URL}/api/ipam/ip-addresses/",
+            headers=HEADERS,
+            json=ip_payload
+        )
+
+        ip_id = None
+        if ip_response.status_code in [200, 201]:
+            ip_id = ip_response.json()['id']
+        else:
+            # IP might already exist, try to find it
+            find_ip = requests.get(
+                f"{NETBOX_URL}/api/ipam/ip-addresses/",
+                headers=HEADERS,
+                params={'address': ip_address}
+            )
+            if find_ip.status_code == 200 and find_ip.json()['count'] > 0:
+                ip_id = find_ip.json()['results'][0]['id']
+
+        # Step 5: Assign IP to device as primary
+        if ip_id:
+            assign_response = requests.patch(
+                f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+                headers=HEADERS,
+                json={'primary_ip4': ip_id}
+            )
+
+        # Step 6: Update custom fields (if they exist)
+        custom_fields = {}
+        if username:
+            custom_fields['onboarding_username'] = username
+        if encrypted_password:
+            custom_fields['onboarding_password'] = encrypted_password
+        if reachable_state is not None:
+            custom_fields['reachable_state'] = reachable_state
+        custom_fields['onboarding_status'] = 'success'
+        custom_fields['device_source'] = 'manual'
+        custom_fields['last_onboarded'] = datetime.now().isoformat()
+
+        if custom_fields:
+            try:
+                requests.patch(
+                    f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+                    headers=HEADERS,
+                    json={'custom_fields': custom_fields}
+                )
+            except Exception:
+                pass  # Custom fields might not exist
+
+        # Return success response
+        return jsonify({
+            'status': 'success',
+            'message': 'Device onboarded successfully',
+            'data': {
+                'device_id': device_id,
+                'device_name': device_name,
+                'ip_address': ip_address,
+                'ip_id': ip_id,
+                'reachable': reachable_state,
+                'latency_ms': latency_ms,
+                'device_type': device_type_id,
+                'role': role_id,
+                'site': site_id
+            }
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/device-types', methods=['GET'])
+def get_device_types():
+    """Get list of available device types"""
+    response = requests.get(f"{NETBOX_URL}/api/dcim/device-types/", headers=HEADERS)
+    if response.status_code == 200:
+        types = [{'id': dt['id'], 'name': dt['display']} for dt in response.json()['results']]
+        return jsonify(types)
+    return jsonify([]), response.status_code
+
+
+@app.route('/api/device-roles', methods=['GET'])
+def get_device_roles():
+    """Get list of available device roles"""
+    response = requests.get(f"{NETBOX_URL}/api/dcim/device-roles/", headers=HEADERS)
+    if response.status_code == 200:
+        roles = [{'id': r['id'], 'name': r['name']} for r in response.json()['results']]
+        return jsonify(roles)
+    return jsonify([]), response.status_code
+
+
+@app.route('/api/sites', methods=['GET'])
+def get_sites():
+    """Get list of available sites"""
+    response = requests.get(f"{NETBOX_URL}/api/dcim/sites/", headers=HEADERS)
+    if response.status_code == 200:
+        sites = [{'id': s['id'], 'name': s['name']} for s in response.json()['results']]
+        return jsonify(sites)
+    return jsonify([]), response.status_code
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'netbox_url': NETBOX_URL})
+
+
+@app.route('/', methods=['GET'])
+def index():
+    """API documentation"""
+    return jsonify({
+        'service': 'Device Onboarding API',
+        'endpoints': {
+            'POST /api/onboard': 'Onboard a device with IP assignment',
+            'GET /api/device-types': 'List available device types',
+            'GET /api/device-roles': 'List available device roles',
+            'GET /api/sites': 'List available sites',
+            'GET /health': 'Health check'
+        },
+        'example_request': {
+            'url': 'POST /api/onboard',
+            'body': {
+                'name': 'CPE-001',
+                'ip': '192.168.1.100',
+                'device_type': 1,
+                'role': 1,
+                'site': 1,
+                'username': 'admin',
+                'password': 'secret123',
+                'skip_ping': False
+            }
+        }
+    })
+
+
+if __name__ == '__main__':
+    print(f"""
+================================================================================
+Device Onboarding API Service
+================================================================================
+NetBox URL: {NETBOX_URL}
+
+Endpoints:
+  POST /api/onboard      - Onboard device with IP (single call!)
+  GET  /api/device-types - List device types
+  GET  /api/device-roles - List device roles
+  GET  /api/sites        - List sites
+  GET  /health           - Health check
+
+Example:
+  curl -X POST http://localhost:5001/api/onboard \\
+    -H "Content-Type: application/json" \\
+    -d '{{"ip": "192.168.1.100", "device_type": 1, "role": 1}}'
+================================================================================
+""")
+    app.run(host='0.0.0.0', port=5001, debug=True)

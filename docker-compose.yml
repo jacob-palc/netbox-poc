@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:
@@ -101,6 +99,21 @@ services:
     ports:
       - "5000:5000"
     environment:
+      NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
+
+  # Device Onboarding API (single-call device creation with IP)
+  onboarding-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.onboarding-api
+    container_name: onboarding-api
+    depends_on:
+      - netbox
+    ports:
+      - "5001:5001"
+    environment:
+      NETBOX_URL: "http://netbox:8080"
+      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
 
 volumes:

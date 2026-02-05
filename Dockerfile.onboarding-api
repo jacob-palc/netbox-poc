@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install flask flask-cors requests cryptography
+
+COPY onboarding_api.py /app/
+
+EXPOSE 5001
+
+CMD ["python", "onboarding_api.py"]
