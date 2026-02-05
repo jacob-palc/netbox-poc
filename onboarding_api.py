@@ -108,7 +108,7 @@ def onboard_device():
         "site": 1,                    # Optional - defaults to 1
         "username": "admin",          # Optional - for custom fields
         "password": "secret123",      # Optional - will be encrypted
-        "skip_ping": false            # Optional - skip reachability check
+        "skip_ping": true             # Optional - skip ping (default: true for fast onboarding)
     }
     """
     try:
@@ -128,7 +128,7 @@ def onboard_device():
         site_id = data.get('site', 1)
         username = data.get('username', '')
         password = data.get('password', '')
-        skip_ping = data.get('skip_ping', False)
+        skip_ping = data.get('skip_ping', True)  # Skip ping by default for fast onboarding
 
         # Step 0: Check if IP address is already assigned to a device
         existing_ip = requests.get(

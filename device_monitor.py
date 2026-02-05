@@ -56,8 +56,10 @@ def ping_device(ip_address, count=PING_COUNT, timeout=PING_TIMEOUT):
         else:
             cmd = ['ping', '-c', str(count), '-W', str(timeout), ip_address]
 
+        logger.debug(f"  Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=count * timeout + 5)
         is_reachable = result.returncode == 0
+        logger.debug(f"  Result: returncode={result.returncode}")
 
         # Parse latency
         output = result.stdout
@@ -147,7 +149,14 @@ def check_device(device):
     current_state = device.get('custom_field_data', {}).get('reachable_state')
 
     # Ping the device
+    logger.info(f"PING {ip_address} ({device_name})...")
     is_reachable, latency_ms = ping_device(ip_address)
+
+    # Log ping result
+    if is_reachable:
+        logger.info(f"  ✓ {ip_address} is REACHABLE (latency: {latency_ms}ms)")
+    else:
+        logger.info(f"  ✗ {ip_address} is UNREACHABLE")
 
     # Only update if state changed or if we want to always update
     if current_state != is_reachable:
