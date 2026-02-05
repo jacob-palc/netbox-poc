@@ -58,23 +58,8 @@ class NetBoxSetup:
         """Create custom fields for device onboarding"""
         print("\n--- Creating Custom Fields ---")
 
-        # Get device content type (NetBox 4.x uses /api/core/content-types/)
-        response = requests.get(
-            f"{self.api_url}/core/content-types/",
-            headers=self.headers,
-            params={'app_label': 'dcim', 'model': 'device'}
-        )
-        if response.status_code != 200:
-            print(f"ERROR: Failed to get content types: {response.text}")
-            return False
-
-        content_types = response.json()['results']
-        if not content_types:
-            print("ERROR: Device content type not found")
-            return False
-
-        device_ct_id = content_types[0]['id']
-        print(f"  Device content type ID: {device_ct_id}")
+        # NetBox 4.x accepts object_types as strings directly (e.g., "dcim.device")
+        # No need to look up content type IDs
 
         # Define custom fields
         custom_fields = [
