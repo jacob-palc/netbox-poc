@@ -58,9 +58,9 @@ class NetBoxSetup:
         """Create custom fields for device onboarding"""
         print("\n--- Creating Custom Fields ---")
 
-        # Get device content type
+        # Get device content type (NetBox 4.x uses /api/core/content-types/)
         response = requests.get(
-            f"{self.api_url}/extras/content-types/",
+            f"{self.api_url}/core/content-types/",
             headers=self.headers,
             params={'app_label': 'dcim', 'model': 'device'}
         )
