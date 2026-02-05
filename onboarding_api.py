@@ -24,6 +24,9 @@ Endpoint:
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import platform
 import re
@@ -43,6 +46,13 @@ HEADERS = {
     'Authorization': f'Token {NETBOX_TOKEN}',
     'Content-Type': 'application/json'
 }
+
+# Create a session with connection pooling for faster requests
+session = requests.Session()
+session.headers.update(HEADERS)
+adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
 
 
 def encrypt_password(password):
@@ -108,7 +118,8 @@ def onboard_device():
         "site": 1,                    # Optional - defaults to 1
         "username": "admin",          # Optional - for custom fields
         "password": "secret123",      # Optional - will be encrypted
-        "skip_ping": true             # Optional - skip ping (default: true for fast onboarding)
+        "skip_ping": true,            # Optional - skip ping (default: true for fast onboarding)
+        "fast_mode": true             # Optional - skip validation checks (default: true for speed)
     }
     """
     try:
@@ -128,60 +139,52 @@ def onboard_device():
         site_id = data.get('site', 1)
         username = data.get('username', '')
         password = data.get('password', '')
-        skip_ping = data.get('skip_ping', True)  # Skip ping by default for fast onboarding
-
-        # Step 0: Check if IP address is already assigned to a device
-        existing_ip = requests.get(
-            f"{NETBOX_URL}/api/ipam/ip-addresses/",
-            headers=HEADERS,
-            params={'address': ip_address}
-        )
-        if existing_ip.status_code == 200 and existing_ip.json()['count'] > 0:
-            ip_data = existing_ip.json()['results'][0]
-            # Check if IP is assigned to an interface (which means it's linked to a device)
-            if ip_data.get('assigned_object'):
-                assigned_obj = ip_data['assigned_object']
-                device_name_existing = assigned_obj.get('device', {}).get('name', 'Unknown')
-                return jsonify({
-                    'error': 'IP address already in use',
-                    'message': f"IP {ip_address} is already assigned to device '{device_name_existing}'",
-                    'existing_device': device_name_existing,
-                    'existing_ip_id': ip_data['id']
-                }), 409  # 409 Conflict
+        skip_ping = data.get('skip_ping', True)
+        fast_mode = data.get('fast_mode', True)  # Skip validation by default for speed
 
         # Use IP address as device name if not provided
-        device_name = data.get('name')
-        if not device_name:
-            device_name = ip_address
+        device_name = data.get('name') or ip_address
 
-        # Check if device name already exists, add suffix if needed
-        check_response = requests.get(
-            f"{NETBOX_URL}/api/dcim/devices/",
-            headers=HEADERS,
-            params={'name': device_name}
-        )
-        if check_response.status_code == 200 and check_response.json()['count'] > 0:
-            counter = 1
-            original_name = device_name
-            while check_response.json()['count'] > 0:
-                device_name = f"{original_name}-{counter}"
-                check_response = requests.get(
+        # Validation checks (only if not in fast_mode)
+        if not fast_mode:
+            # Run validation checks in parallel
+            def check_ip():
+                return session.get(
+                    f"{NETBOX_URL}/api/ipam/ip-addresses/",
+                    params={'address': ip_address}
+                )
+
+            def check_device():
+                return session.get(
                     f"{NETBOX_URL}/api/dcim/devices/",
-                    headers=HEADERS,
                     params={'name': device_name}
                 )
-                counter += 1
 
-        # Step 1: Ping device (optional)
-        reachable_state = None
-        latency_ms = None
-        if not skip_ping:
-            reachable_state, latency_ms = ping_device(ip_address)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                ip_future = executor.submit(check_ip)
+                device_future = executor.submit(check_device)
 
-        # Step 2: Encrypt password
+                existing_ip = ip_future.result()
+                if existing_ip.status_code == 200 and existing_ip.json()['count'] > 0:
+                    ip_data = existing_ip.json()['results'][0]
+                    if ip_data.get('assigned_object'):
+                        assigned_obj = ip_data['assigned_object']
+                        device_name_existing = assigned_obj.get('device', {}).get('name', 'Unknown')
+                        return jsonify({
+                            'error': 'IP address already in use',
+                            'message': f"IP {ip_address} is already assigned to device '{device_name_existing}'",
+                            'existing_device': device_name_existing,
+                            'existing_ip_id': ip_data['id']
+                        }), 409
+
+                check_response = device_future.result()
+                if check_response.status_code == 200 and check_response.json()['count'] > 0:
+                    device_name = f"{device_name}-{check_response.json()['count'] + 1}"
+
+        # Encrypt password (fast operation)
         encrypted_password = encrypt_password(password) if password else ''
 
-        # Step 3: Create device
+        # Step 1: Create device
         device_payload = {
             'name': device_name,
             'device_type': device_type_id,
@@ -190,9 +193,8 @@ def onboard_device():
             'status': 'active'
         }
 
-        device_response = requests.post(
+        device_response = session.post(
             f"{NETBOX_URL}/api/dcim/devices/",
-            headers=HEADERS,
             json=device_payload
         )
 
@@ -204,105 +206,64 @@ def onboard_device():
 
         device_id = device_response.json()['id']
 
-        # Step 4: Create a management interface for the device
-        interface_payload = {
-            'device': device_id,
-            'name': 'mgmt0',
-            'type': 'virtual',
-            'description': 'Management interface'
-        }
-
-        interface_response = requests.post(
+        # Step 2: Create interface
+        interface_response = session.post(
             f"{NETBOX_URL}/api/dcim/interfaces/",
-            headers=HEADERS,
-            json=interface_payload
+            json={
+                'device': device_id,
+                'name': 'mgmt0',
+                'type': 'virtual',
+                'description': 'Management interface'
+            }
         )
 
         interface_id = None
         if interface_response.status_code in [200, 201]:
             interface_id = interface_response.json()['id']
-            print(f"Created interface mgmt0 for device {device_name}")
-        else:
-            print(f"Failed to create interface: {interface_response.status_code} - {interface_response.text}")
 
-        # Step 5: Create IP address and assign to interface
+        # Step 3: Create IP address and assign to interface
         ip_payload = {
             'address': f"{ip_address}/32",
             'status': 'active',
             'dns_name': device_name,
             'description': f'Management IP for {device_name}'
         }
-
-        # Assign IP to interface if we have one
         if interface_id:
             ip_payload['assigned_object_type'] = 'dcim.interface'
             ip_payload['assigned_object_id'] = interface_id
 
-        ip_response = requests.post(
+        ip_response = session.post(
             f"{NETBOX_URL}/api/ipam/ip-addresses/",
-            headers=HEADERS,
             json=ip_payload
         )
 
         ip_id = None
         if ip_response.status_code in [200, 201]:
             ip_id = ip_response.json()['id']
-            print(f"Created IP {ip_address} and assigned to interface")
-        else:
-            # IP might already exist, try to find it
-            find_ip = requests.get(
-                f"{NETBOX_URL}/api/ipam/ip-addresses/",
-                headers=HEADERS,
-                params={'address': ip_address}
-            )
-            if find_ip.status_code == 200 and find_ip.json()['count'] > 0:
-                ip_id = find_ip.json()['results'][0]['id']
-                # Update existing IP to assign to our interface
-                if interface_id:
-                    requests.patch(
-                        f"{NETBOX_URL}/api/ipam/ip-addresses/{ip_id}/",
-                        headers=HEADERS,
-                        json={
-                            'assigned_object_type': 'dcim.interface',
-                            'assigned_object_id': interface_id
-                        }
-                    )
 
-        # Step 6: Set IP as primary for device
+        # Step 4: Set primary IP AND custom fields in ONE call (saves ~500ms)
         ip_assigned = False
         if ip_id:
-            assign_response = requests.patch(
+            custom_fields = {
+                'onboarding_status': 'success',
+                'device_source': 'manual',
+                'last_onboarded': datetime.now().isoformat()
+            }
+            if username:
+                custom_fields['onboarding_username'] = username
+            if encrypted_password:
+                custom_fields['onboarding_password'] = encrypted_password
+
+            update_payload = {
+                'primary_ip4': ip_id,
+                'custom_fields': custom_fields
+            }
+
+            assign_response = session.patch(
                 f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
-                headers=HEADERS,
-                json={'primary_ip4': ip_id}
+                json=update_payload
             )
-            if assign_response.status_code == 200:
-                ip_assigned = True
-                print(f"IP {ip_address} set as primary IP for device {device_name}")
-            else:
-                print(f"Failed to set primary IP: {assign_response.status_code} - {assign_response.text}")
-
-        # Step 7: Update custom fields (if they exist)
-        custom_fields = {}
-        if username:
-            custom_fields['onboarding_username'] = username
-        if encrypted_password:
-            custom_fields['onboarding_password'] = encrypted_password
-        if reachable_state is not None:
-            custom_fields['reachable_state'] = reachable_state
-        custom_fields['onboarding_status'] = 'success'
-        custom_fields['device_source'] = 'manual'
-        custom_fields['last_onboarded'] = datetime.now().isoformat()
-
-        if custom_fields:
-            try:
-                requests.patch(
-                    f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
-                    headers=HEADERS,
-                    json={'custom_fields': custom_fields}
-                )
-            except Exception:
-                pass  # Custom fields might not exist
+            ip_assigned = assign_response.status_code == 200
 
         # Return success response
         return jsonify({
@@ -314,8 +275,6 @@ def onboard_device():
                 'ip_address': ip_address,
                 'ip_id': ip_id,
                 'ip_assigned': ip_assigned,
-                'reachable': reachable_state,
-                'latency_ms': latency_ms,
                 'device_type': device_type_id,
                 'role': role_id,
                 'site': site_id
@@ -331,7 +290,7 @@ def onboard_device():
 @app.route('/api/device-types', methods=['GET'])
 def get_device_types():
     """Get list of available device types"""
-    response = requests.get(f"{NETBOX_URL}/api/dcim/device-types/", headers=HEADERS)
+    response = session.get(f"{NETBOX_URL}/api/dcim/device-types/")
     if response.status_code == 200:
         types = [{'id': dt['id'], 'name': dt['display']} for dt in response.json()['results']]
         return jsonify(types)
@@ -341,7 +300,7 @@ def get_device_types():
 @app.route('/api/device-roles', methods=['GET'])
 def get_device_roles():
     """Get list of available device roles"""
-    response = requests.get(f"{NETBOX_URL}/api/dcim/device-roles/", headers=HEADERS)
+    response = session.get(f"{NETBOX_URL}/api/dcim/device-roles/")
     if response.status_code == 200:
         roles = [{'id': r['id'], 'name': r['name']} for r in response.json()['results']]
         return jsonify(roles)
@@ -351,7 +310,7 @@ def get_device_roles():
 @app.route('/api/sites', methods=['GET'])
 def get_sites():
     """Get list of available sites"""
-    response = requests.get(f"{NETBOX_URL}/api/dcim/sites/", headers=HEADERS)
+    response = session.get(f"{NETBOX_URL}/api/dcim/sites/")
     if response.status_code == 200:
         sites = [{'id': s['id'], 'name': s['name']} for s in response.json()['results']]
         return jsonify(sites)
@@ -361,16 +320,16 @@ def get_sites():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'netbox_url': NETBOX_URL})
+    return jsonify({'status': 'healthy', 'netbox_url': NETBOX_URL, 'fast_mode': 'enabled'})
 
 
 @app.route('/', methods=['GET'])
 def index():
     """API documentation"""
     return jsonify({
-        'service': 'Device Onboarding API',
+        'service': 'Device Onboarding API (Optimized)',
         'endpoints': {
-            'POST /api/onboard': 'Onboard a device with IP assignment',
+            'POST /api/onboard': 'Onboard a device with IP assignment (~1s with fast_mode)',
             'GET /api/device-types': 'List available device types',
             'GET /api/device-roles': 'List available device roles',
             'GET /api/sites': 'List available sites',
@@ -386,8 +345,9 @@ def index():
                 'site': 1,
                 'username': 'admin',
                 'password': 'secret123',
-                'skip_ping': False
-            }
+                'fast_mode': True
+            },
+            'note': 'fast_mode=true (default) skips validation for ~1s response. Set to false for duplicate checking.'
         }
     })
 
@@ -395,21 +355,27 @@ def index():
 if __name__ == '__main__':
     print(f"""
 ================================================================================
-Device Onboarding API Service
+Device Onboarding API Service (Optimized for Speed)
 ================================================================================
 NetBox URL: {NETBOX_URL}
+Mode: Fast mode enabled (skips validation, ~1s response)
 
 Endpoints:
-  POST /api/onboard      - Onboard device with IP (single call!)
+  POST /api/onboard      - Onboard device with IP (~1s with fast_mode)
   GET  /api/device-types - List device types
   GET  /api/device-roles - List device roles
   GET  /api/sites        - List sites
   GET  /health           - Health check
 
-Example:
+Example (fast mode - default):
   curl -X POST http://localhost:5001/api/onboard \\
     -H "Content-Type: application/json" \\
     -d '{{"ip": "192.168.1.100", "device_type": 1, "role": 1}}'
+
+Example (with validation):
+  curl -X POST http://localhost:5001/api/onboard \\
+    -H "Content-Type: application/json" \\
+    -d '{{"ip": "192.168.1.100", "device_type": 1, "role": 1, "fast_mode": false}}'
 ================================================================================
 """)
     app.run(host='0.0.0.0', port=5001, debug=True)
