@@ -65,7 +65,7 @@ services:
       - ./netbox/scripts:/opt/netbox/netbox/scripts:ro
       - netbox-media-files:/opt/netbox/netbox/media
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login/"]
       interval: 30s
       timeout: 10s
       retries: 5
