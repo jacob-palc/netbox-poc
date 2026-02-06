@@ -62,7 +62,7 @@ services:
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
       # Server2 NMS Validation (validates SSH before telemetry config)
       SERVER2_VALIDATION_ENABLED: "true"
-      SERVER2_BASE_URL: "http://10.4.160.240:8081"
+      SERVER2_BASE_URL: "http://10.4.160.240:5000"
       SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
       SERVER2_DEVICE_ENDPOINT: "/device"
       SERVER2_USERNAME: "admin"
@@ -104,7 +104,7 @@ services:
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
       # Server2 NMS Validation
       SERVER2_VALIDATION_ENABLED: "true"
-      SERVER2_BASE_URL: "http://10.4.160.240:8081"
+      SERVER2_BASE_URL: "http://10.4.160.240:5000"
       SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
       SERVER2_DEVICE_ENDPOINT: "/device"
       SERVER2_USERNAME: "admin"
@@ -148,7 +148,7 @@ services:
       - "5002:5002"
     environment:
       # Server2 (SSH Validation)
-      SERVER2_BASE_URL: "http://10.4.160.240:8081"
+      SERVER2_BASE_URL: "http://10.4.160.240:5000"
       SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
       SERVER2_DEVICE_ENDPOINT: "/device"
       SERVER2_USERNAME: "admin"
