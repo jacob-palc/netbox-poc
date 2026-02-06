@@ -530,22 +530,27 @@ def onboard_device_dhcp():
 
         # ================== CHECK IP - ALLOW ONLY IF DEVICE IS DOWN ==================
         # For DHCP: Same IP can be reassigned to different MAC ONLY if device is down
+        existing_ip_id = None  # Track if we're reassigning an existing IP
         if ip_address:
             ip_device_check = check_ip_device_reachable(ip_address)
-            if ip_device_check['exists'] and not ip_device_check['can_reassign']:
-                return jsonify({
-                    'status': 'error',
-                    'error': 'IP is assigned to an active device',
-                    'field': 'ip',
-                    'ip_address': ip_address,
-                    'existing': {
-                        'device_id': ip_device_check.get('device_id'),
-                        'device_name': ip_device_check.get('device_name'),
-                        'device_reachable': ip_device_check.get('device_reachable'),
-                        'reason': ip_device_check.get('reason')
-                    },
-                    'hint': 'IP can only be reassigned if the device is down (reachable=false)'
-                }), 409
+            if ip_device_check['exists']:
+                if not ip_device_check['can_reassign']:
+                    return jsonify({
+                        'status': 'error',
+                        'error': 'IP is assigned to an active device',
+                        'field': 'ip',
+                        'ip_address': ip_address,
+                        'existing': {
+                            'device_id': ip_device_check.get('device_id'),
+                            'device_name': ip_device_check.get('device_name'),
+                            'device_reachable': ip_device_check.get('device_reachable'),
+                            'reason': ip_device_check.get('reason')
+                        },
+                        'hint': 'IP can only be reassigned if the device is down (reachable=false)'
+                    }), 409
+                else:
+                    # IP exists and can be reassigned - save the IP ID for later reassignment
+                    existing_ip_id = ip_device_check.get('ip_id')
 
         # ================== CREATE DEVICE ==================
         # Always use MAC as device name (unique identifier for DHCP devices)
@@ -589,12 +594,13 @@ def onboard_device_dhcp():
         device_id = device_data['id']
 
         # ================== CREATE INTERFACE WITH MAC ==================
+        # Use 'other' type which supports MAC addresses (virtual type doesn't)
         interface_response = session.post(
             f"{NETBOX_URL}/api/dcim/interfaces/",
             json={
                 'device': device_id,
                 'name': 'eth0',
-                'type': 'virtual',
+                'type': 'other',
                 'mac_address': mac_address
             }
         )
@@ -609,31 +615,52 @@ def onboard_device_dhcp():
         else:
             interface_error = interface_response.text
 
-        # ================== CREATE IP ADDRESS (if provided) ==================
+        # ================== HANDLE IP ADDRESS (if provided) ==================
         ip_id = None
         ip_create_error = None
+        ip_reassigned = False
         primary_ip_set = False
         assign_error = None
 
         if ip_address and interface_id:
-            cidr = f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128"
+            # Check if we're reassigning an existing IP or creating new
+            if existing_ip_id:
+                # REASSIGN: Update existing IP to point to new interface
+                reassign_response = session.patch(
+                    f"{NETBOX_URL}/api/ipam/ip-addresses/{existing_ip_id}/",
+                    json={
+                        'assigned_object_type': 'dcim.interface',
+                        'assigned_object_id': interface_id,
+                        'status': 'dhcp'
+                    }
+                )
+                if reassign_response.status_code == 200:
+                    ip_id = existing_ip_id
+                    ip_reassigned = True
+                else:
+                    ip_create_error = f"Failed to reassign IP: {reassign_response.text}"
+            else:
+                # CREATE: New IP address
+                cidr = f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128"
+                ip_payload = {
+                    'address': cidr,
+                    'status': 'dhcp',
+                    'assigned_object_type': 'dcim.interface',
+                    'assigned_object_id': interface_id
+                }
 
-            ip_payload = {
-                'address': cidr,
-                'status': 'dhcp',
-                'assigned_object_type': 'dcim.interface',
-                'assigned_object_id': interface_id
-            }
+                ip_response = session.post(
+                    f"{NETBOX_URL}/api/ipam/ip-addresses/",
+                    json=ip_payload
+                )
 
-            ip_response = session.post(
-                f"{NETBOX_URL}/api/ipam/ip-addresses/",
-                json=ip_payload
-            )
+                if ip_response.status_code in [200, 201]:
+                    ip_id = ip_response.json()['id']
+                else:
+                    ip_create_error = ip_response.text
 
-            if ip_response.status_code in [200, 201]:
-                ip_id = ip_response.json()['id']
-
-                # Set as primary IP
+            # Set as primary IP if we have an IP
+            if ip_id:
                 primary_field = 'primary_ip4' if ip_version == 'ipv4' else 'primary_ip6'
                 assign_response = session.patch(
                     f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
@@ -642,8 +669,6 @@ def onboard_device_dhcp():
                 primary_ip_set = assign_response.status_code == 200
                 if not primary_ip_set:
                     assign_error = assign_response.text
-            else:
-                ip_create_error = ip_response.text
 
         # ================== SUCCESS ==================
         return jsonify({
@@ -657,6 +682,7 @@ def onboard_device_dhcp():
                 'ip_address': ip_address,
                 'ip_version': ip_version,
                 'ip_id': ip_id,
+                'ip_reassigned': ip_reassigned,
                 'interface_id': interface_id,
                 'device_type': device_type_id,
                 'role': role_id,
