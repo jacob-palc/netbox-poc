@@ -363,8 +363,11 @@ def onboard_device():
         )
 
         interface_id = None
+        interface_error = None
         if interface_response.status_code in [200, 201]:
             interface_id = interface_response.json()['id']
+        else:
+            interface_error = interface_response.text
 
         # ================== CREATE IP ADDRESS ==================
         cidr = f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128"
@@ -383,8 +386,11 @@ def onboard_device():
         )
 
         ip_id = None
+        ip_create_error = None
         if ip_response.status_code in [200, 201]:
             ip_id = ip_response.json()['id']
+        else:
+            ip_create_error = ip_response.text
 
         # ================== SET PRIMARY IP ==================
         primary_ip_set = False
@@ -417,6 +423,8 @@ def onboard_device():
                 'role': role_id,
                 'site': site_id,
                 'primary_ip_assigned': primary_ip_set,
+                'interface_error': interface_error,
+                'ip_create_error': ip_create_error,
                 'assign_error': assign_error,
                 'onboard_type': 'manual'
             }
