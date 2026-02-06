@@ -64,71 +64,45 @@ class NetBoxSetup:
         # Define custom fields
         custom_fields = [
             {
-                'name': 'onboarding_username',
+                'name': 'username',
                 'type': 'text',
-                'label': 'Onboarding Username',
-                'description': 'Username for device access (SNMP community or SSH user)',
+                'label': 'Username',
+                'description': 'SSH username for device access',
                 'weight': 100,
-                'object_types': [f'dcim.device']
+                'object_types': ['dcim.device']
             },
             {
-                'name': 'onboarding_password',
+                'name': 'password',
                 'type': 'text',
-                'label': 'Onboarding Password (Encrypted)',
-                'description': 'Encrypted password for device access',
+                'label': 'Password (Encrypted)',
+                'description': 'Encrypted SSH password for device access',
                 'weight': 110,
                 'ui_visible': 'hidden',
-                'object_types': [f'dcim.device']
+                'object_types': ['dcim.device']
             },
             {
-                'name': 'reachable_state',
+                'name': 'reachable',
                 'type': 'boolean',
-                'label': 'Reachable State',
-                'description': 'Whether the device is reachable (set by telemetry)',
+                'label': 'Reachable',
+                'description': 'Whether the device is reachable via ping',
                 'weight': 120,
-                'object_types': [f'dcim.device']
+                'object_types': ['dcim.device']
             },
             {
-                'name': 'last_onboarded',
-                'type': 'datetime',
-                'label': 'Last Onboarded',
-                'description': 'Timestamp of last onboarding',
+                'name': 'authentication',
+                'type': 'boolean',
+                'label': 'Authentication',
+                'description': 'Whether SSH authentication was successful',
                 'weight': 130,
-                'object_types': [f'dcim.device']
+                'object_types': ['dcim.device']
             },
             {
-                'name': 'onboarding_status',
-                'type': 'select',
-                'label': 'Onboarding Status',
-                'description': 'Status of device onboarding',
+                'name': 'management',
+                'type': 'boolean',
+                'label': 'Management',
+                'description': 'Whether device is under management',
                 'weight': 140,
-                'choice_set': None,
-                'object_types': [f'dcim.device']
-            },
-            {
-                'name': 'device_source',
-                'type': 'select',
-                'label': 'Device Source',
-                'description': 'How the device was added to NetBox',
-                'weight': 150,
-                'choice_set': None,
-                'object_types': [f'dcim.device']
-            },
-            {
-                'name': 'last_reachability_check',
-                'type': 'datetime',
-                'label': 'Last Reachability Check',
-                'description': 'Timestamp of last ping check by monitor',
-                'weight': 160,
-                'object_types': [f'dcim.device']
-            },
-            {
-                'name': 'last_latency_ms',
-                'type': 'decimal',
-                'label': 'Last Latency (ms)',
-                'description': 'Last measured ping latency in milliseconds',
-                'weight': 170,
-                'object_types': [f'dcim.device']
+                'object_types': ['dcim.device']
             }
         ]
 
@@ -359,20 +333,17 @@ class NetBoxSetup:
     "device_id": {{ data.id }},
     "device_name": "{{ data.name }}",
     "ip_address": "{% if data.primary_ip4 %}{{ data.primary_ip4.address.ip }}{% else %}null{% endif %}",
-    "username": "{{ data.custom_field_data.onboarding_username }}",
-    "password": "{{ data.custom_field_data.onboarding_password }}",
+    "username": "{{ data.custom_field_data.username }}",
+    "password": "{{ data.custom_field_data.password }}",
     "device_role": "{{ data.role.name }}",
     "device_type": "{{ data.device_type.manufacturer.name }} {{ data.device_type.model }}",
     "manufacturer": "{{ data.device_type.manufacturer.name }}",
     "model": "{{ data.device_type.model }}",
     "site": "{{ data.site.name }}",
     "status": "{{ data.status }}",
-    "reachable_state": {% if data.custom_field_data.reachable_state is not none %}{{ data.custom_field_data.reachable_state|lower }}{% else %}null{% endif %},
-    "device_source": "{{ data.custom_field_data.device_source }}",
-    "last_onboarded": "{{ data.custom_field_data.last_onboarded }}",
-    "onboarding_status": "{{ data.custom_field_data.onboarding_status }}",
-    "last_reachability_check": "{{ data.custom_field_data.last_reachability_check }}",
-    "last_latency_ms": {% if data.custom_field_data.last_latency_ms is not none %}{{ data.custom_field_data.last_latency_ms }}{% else %}null{% endif %}
+    "reachable": {% if data.custom_field_data.reachable is not none %}{{ data.custom_field_data.reachable|lower }}{% else %}null{% endif %},
+    "authentication": {% if data.custom_field_data.authentication is not none %}{{ data.custom_field_data.authentication|lower }}{% else %}null{% endif %},
+    "management": {% if data.custom_field_data.management is not none %}{{ data.custom_field_data.management|lower }}{% else %}null{% endif %}
   }
 }'''
         }
@@ -409,7 +380,7 @@ class NetBoxSetup:
             print("  WARNING: Skipping event rules - no webhook ID")
             return None
 
-        # Event rule 1: Device Onboarding (new devices with onboarding_status = success)
+        # Event rule 1: Device Onboarding (new devices created)
         onboarding_rule = {
             'name': 'Device Onboarding Event',
             'enabled': True,
@@ -417,31 +388,21 @@ class NetBoxSetup:
             'event_types': ['object_created'],
             'action_type': 'webhook',
             'action_object_type': 'extras.webhook',
-            'action_object_id': webhook_id,
-            'conditions': {
-                'and': [
-                    {'attr': 'custom_field_data.onboarding_status', 'value': 'success'}
-                ]
-            }
+            'action_object_id': webhook_id
         }
 
-        # Event rule 2: Device Reachability Update (any device update with reachable_state set)
-        reachability_rule = {
-            'name': 'Device Reachability Update',
+        # Event rule 2: Device Update (any device update)
+        update_rule = {
+            'name': 'Device Update Event',
             'enabled': True,
             'object_types': ['dcim.device'],
             'event_types': ['object_updated'],
             'action_type': 'webhook',
             'action_object_type': 'extras.webhook',
-            'action_object_id': webhook_id,
-            'conditions': {
-                'and': [
-                    {'attr': 'custom_field_data.last_reachability_check', 'negate': True, 'value': ''}
-                ]
-            }
+            'action_object_id': webhook_id
         }
 
-        rules = [onboarding_rule, reachability_rule]
+        rules = [onboarding_rule, update_rule]
         created_ids = []
 
         for rule_data in rules:
