@@ -109,6 +109,84 @@ def check_ip_exists(ip_address):
         return {'exists': False, 'error': str(e)}
 
 
+def check_ip_device_reachable(ip_address):
+    """
+    Check if IP exists and if the device is reachable.
+    Used for DHCP to allow IP reassignment only if device is down.
+    """
+    try:
+        # First check if IP exists
+        ip_check = check_ip_exists(ip_address)
+        if not ip_check['exists']:
+            return {'exists': False, 'can_reassign': True}
+
+        device_id = ip_check.get('device_id')
+        if not device_id:
+            # IP exists but not assigned to device - can reassign
+            return {
+                'exists': True,
+                'can_reassign': True,
+                'ip_id': ip_check.get('ip_id'),
+                'reason': 'IP not assigned to any device'
+            }
+
+        # Get device details including reachable status
+        response = session.get(f"{NETBOX_URL}/api/dcim/devices/{device_id}/")
+        if response.status_code == 200:
+            device = response.json()
+            custom_fields = device.get('custom_fields', {})
+            reachable = custom_fields.get('reachable', None)
+
+            # If reachable is True (device is up), don't allow reassignment
+            if reachable is True:
+                return {
+                    'exists': True,
+                    'can_reassign': False,
+                    'device_id': device_id,
+                    'device_name': device.get('name'),
+                    'device_reachable': True,
+                    'ip_id': ip_check.get('ip_id'),
+                    'reason': 'Device is reachable (up)'
+                }
+            else:
+                # Device is down or reachable status unknown - allow reassignment
+                return {
+                    'exists': True,
+                    'can_reassign': True,
+                    'device_id': device_id,
+                    'device_name': device.get('name'),
+                    'device_reachable': reachable,
+                    'ip_id': ip_check.get('ip_id'),
+                    'reason': 'Device is down or status unknown'
+                }
+
+        return {'exists': True, 'can_reassign': True, 'reason': 'Could not get device status'}
+    except Exception as e:
+        return {'exists': False, 'can_reassign': True, 'error': str(e)}
+
+
+def check_device_exists(device_name):
+    """Check if device name already exists in NetBox"""
+    try:
+        response = session.get(
+            f"{NETBOX_URL}/api/dcim/devices/",
+            params={'name': device_name}
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if data['count'] > 0:
+                result = data['results'][0]
+                return {
+                    'exists': True,
+                    'device_id': result['id'],
+                    'device_name': result['name'],
+                    'primary_ip': result.get('primary_ip4', {}).get('address') if result.get('primary_ip4') else None
+                }
+        return {'exists': False}
+    except Exception as e:
+        return {'exists': False, 'error': str(e)}
+
+
 def check_mac_exists(mac_address):
     """Check if MAC address already exists in NetBox interfaces"""
     try:
@@ -196,7 +274,23 @@ def onboard_device():
                 'field': 'role'
             }), 400
 
-        # ================== CHECK DUPLICATE IP ==================
+        # ================== CHECK DUPLICATES ==================
+        # Check if device with this IP as name already exists
+        device_check = check_device_exists(ip_address)
+        if device_check['exists']:
+            return jsonify({
+                'status': 'error',
+                'error': 'Device already exists with this IP',
+                'field': 'ip',
+                'ip_address': ip_address,
+                'existing': {
+                    'device_id': device_check.get('device_id'),
+                    'device_name': device_check.get('device_name'),
+                    'primary_ip': device_check.get('primary_ip')
+                }
+            }), 409
+
+        # Check if IP address already exists
         ip_check = check_ip_exists(ip_address)
         if ip_check['exists']:
             return jsonify({
@@ -398,51 +492,50 @@ def onboard_device_dhcp():
                     'field': 'ip'
                 }), 400
 
-        # ================== CHECK DUPLICATE MAC ==================
-        mac_check = check_mac_exists(mac_address)
-        if mac_check['exists']:
+        # ================== CHECK DUPLICATE MAC (device name = MAC) ==================
+        # Check if device with name=MAC already exists
+        device_check = check_device_exists(mac_address)
+        if device_check['exists']:
             return jsonify({
                 'status': 'error',
-                'error': 'MAC address already exists',
+                'error': 'Device already exists with this MAC',
                 'field': 'mac',
                 'mac_address': mac_address,
                 'existing': {
-                    'interface_id': mac_check.get('interface_id'),
-                    'device_id': mac_check.get('device_id'),
-                    'device_name': mac_check.get('device_name')
+                    'device_id': device_check.get('device_id'),
+                    'device_name': device_check.get('device_name'),
+                    'primary_ip': device_check.get('primary_ip')
                 }
             }), 409
 
-        # Check duplicate IP if provided
+        # ================== CHECK IP - ALLOW ONLY IF DEVICE IS DOWN ==================
+        # For DHCP: Same IP can be reassigned to different MAC ONLY if device is down
         if ip_address:
-            ip_check = check_ip_exists(ip_address)
-            if ip_check['exists']:
+            ip_device_check = check_ip_device_reachable(ip_address)
+            if ip_device_check['exists'] and not ip_device_check['can_reassign']:
                 return jsonify({
                     'status': 'error',
-                    'error': 'IP address already exists',
+                    'error': 'IP is assigned to an active device',
                     'field': 'ip',
                     'ip_address': ip_address,
                     'existing': {
-                        'ip_id': ip_check.get('ip_id'),
-                        'device_id': ip_check.get('device_id'),
-                        'device_name': ip_check.get('device_name')
-                    }
+                        'device_id': ip_device_check.get('device_id'),
+                        'device_name': ip_device_check.get('device_name'),
+                        'device_reachable': ip_device_check.get('device_reachable'),
+                        'reason': ip_device_check.get('reason')
+                    },
+                    'hint': 'IP can only be reassigned if the device is down (reachable=false)'
                 }), 409
 
         # ================== CREATE DEVICE ==================
-        # Use hostname, MAC, or IP as device name
-        if hostname:
-            device_name = hostname
-        elif ip_address:
-            device_name = ip_address
-        else:
-            device_name = f"DHCP-{mac_address.replace(':', '')}"
+        # Always use MAC as device name (unique identifier for DHCP devices)
+        device_name = mac_address
 
-        custom_fields = {
-            'onboarding_status': 'success',
-            'device_source': 'dhcp',
-            'last_onboarded': datetime.now().isoformat()
-        }
+        # Custom fields
+        custom_fields = {}
+        # hostname is just metadata, stored in custom field if provided
+        if hostname:
+            custom_fields['hostname'] = hostname
 
         device_payload = {
             'name': device_name,
