@@ -28,9 +28,12 @@ services:
       timeout: 5s
       retries: 5
 
-  # NetBox Application
+  # NetBox Application (custom build with Server2 validation)
   netbox:
-    image: netboxcommunity/netbox:v4.2
+    build:
+      context: .
+      dockerfile: Dockerfile.netbox-custom
+    image: netbox-custom:v4.2
     container_name: netbox
     depends_on:
       postgres:
@@ -70,8 +73,6 @@ services:
       - "8000:8080"
     volumes:
       - ./netbox/scripts:/opt/netbox/netbox/scripts:ro
-      - ./netbox/extras/server2_client.py:/opt/netbox/netbox/extras/server2_client.py:ro
-      - ./netbox/extras/webhooks.py:/opt/netbox/netbox/extras/webhooks.py:ro
       - netbox-media-files:/opt/netbox/netbox/media
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/login/"]
@@ -82,7 +83,10 @@ services:
 
   # NetBox Worker (for background tasks like webhooks)
   netbox-worker:
-    image: netboxcommunity/netbox:v4.2
+    build:
+      context: .
+      dockerfile: Dockerfile.netbox-custom
+    image: netbox-custom:v4.2
     container_name: netbox-worker
     depends_on:
       netbox:
@@ -105,9 +109,6 @@ services:
       SERVER2_DEVICE_ENDPOINT: "/device"
       SERVER2_USERNAME: "admin"
       SERVER2_PASSWORD: "admin"
-    volumes:
-      - ./netbox/extras/server2_client.py:/opt/netbox/netbox/extras/server2_client.py:ro
-      - ./netbox/extras/webhooks.py:/opt/netbox/netbox/extras/webhooks.py:ro
 
   # Mock Telemetry Service (to test webhooks)
   telemetry-mock:

@@ -1,0 +1,9 @@
+FROM netboxcommunity/netbox:v4.2
+
+# Copy custom Server2 validation files
+COPY netbox/extras/server2_client.py /opt/netbox/netbox/extras/server2_client.py
+COPY netbox/extras/webhooks.py /opt/netbox/netbox/extras/webhooks.py
+
+# Set proper permissions
+RUN chown unit:root /opt/netbox/netbox/extras/server2_client.py && \
+    chown unit:root /opt/netbox/netbox/extras/webhooks.py
