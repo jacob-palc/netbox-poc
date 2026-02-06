@@ -215,15 +215,12 @@ def onboard_device():
         device_name = ip_address  # Use IP as display name
         encrypted_password = encrypt_password(password) if password else ''
 
-        custom_fields = {
-            'onboarding_status': 'success',
-            'device_source': 'manual',
-            'last_onboarded': datetime.now().isoformat()
-        }
+        # Custom fields - use 'username' and 'password' field names
+        custom_fields = {}
         if username:
-            custom_fields['onboarding_username'] = username
+            custom_fields['username'] = username
         if encrypted_password:
-            custom_fields['onboarding_password'] = encrypted_password
+            custom_fields['password'] = encrypted_password
 
         device_payload = {
             'name': device_name,
