@@ -594,18 +594,26 @@ def onboard_device_dhcp():
             json={
                 'device': device_id,
                 'name': 'eth0',
-                'type': '1000base-t',
+                'type': 'virtual',
                 'mac_address': mac_address
             }
         )
 
         interface_id = None
+        interface_error = None
+        interface_mac = None
         if interface_response.status_code in [200, 201]:
-            interface_id = interface_response.json()['id']
+            interface_data = interface_response.json()
+            interface_id = interface_data['id']
+            interface_mac = interface_data.get('mac_address')
+        else:
+            interface_error = interface_response.text
 
         # ================== CREATE IP ADDRESS (if provided) ==================
         ip_id = None
+        ip_create_error = None
         primary_ip_set = False
+        assign_error = None
 
         if ip_address and interface_id:
             cidr = f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128"
@@ -632,6 +640,10 @@ def onboard_device_dhcp():
                     json={primary_field: ip_id}
                 )
                 primary_ip_set = assign_response.status_code == 200
+                if not primary_ip_set:
+                    assign_error = assign_response.text
+            else:
+                ip_create_error = ip_response.text
 
         # ================== SUCCESS ==================
         return jsonify({
@@ -641,6 +653,7 @@ def onboard_device_dhcp():
                 'device_id': device_id,          # PRIMARY KEY
                 'device_name': device_name,
                 'mac_address': mac_address,
+                'interface_mac': interface_mac,
                 'ip_address': ip_address,
                 'ip_version': ip_version,
                 'ip_id': ip_id,
@@ -649,6 +662,9 @@ def onboard_device_dhcp():
                 'role': role_id,
                 'site': site_id,
                 'primary_ip_assigned': primary_ip_set,
+                'interface_error': interface_error,
+                'ip_create_error': ip_create_error,
+                'assign_error': assign_error,
                 'onboard_type': 'dhcp'
             }
         }), 201
