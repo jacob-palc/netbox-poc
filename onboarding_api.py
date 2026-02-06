@@ -44,17 +44,22 @@ session.mount('http://', adapter)
 session.mount('https://', adapter)
 
 # Regex patterns
-IPV4_PATTERN = re.compile(r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$')
-IPV6_PATTERN = re.compile(r'^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,7}:$|^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}$|^(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}$|^(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}$|^[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}$|^:(?::[0-9a-fA-F]{1,4}){1,7}$|^::$')
 MAC_PATTERN = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{4}\.){2}([0-9A-Fa-f]{4})$')
+
+# Use Python's ipaddress module for reliable IP validation
+import ipaddress
 
 
 def detect_ip_version(ip):
-    """Detect if IP is IPv4 or IPv6"""
-    if IPV4_PATTERN.match(ip):
-        return 'ipv4'
-    elif IPV6_PATTERN.match(ip):
-        return 'ipv6'
+    """Detect if IP is IPv4 or IPv6 using Python's ipaddress module"""
+    try:
+        addr = ipaddress.ip_address(ip)
+        if isinstance(addr, ipaddress.IPv4Address):
+            return 'ipv4'
+        elif isinstance(addr, ipaddress.IPv6Address):
+            return 'ipv6'
+    except ValueError:
+        pass
     return None
 
 
@@ -383,13 +388,17 @@ def onboard_device():
 
         # ================== SET PRIMARY IP ==================
         primary_ip_set = False
+        primary_field = 'primary_ip4' if ip_version == 'ipv4' else 'primary_ip6'
+        assign_error = None
+
         if ip_id:
-            primary_field = 'primary_ip4' if ip_version == 'ipv4' else 'primary_ip6'
             assign_response = session.patch(
                 f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
                 json={primary_field: ip_id}
             )
             primary_ip_set = assign_response.status_code == 200
+            if not primary_ip_set:
+                assign_error = assign_response.text
 
         # ================== SUCCESS ==================
         return jsonify({
@@ -401,11 +410,14 @@ def onboard_device():
                 'ip_address': ip_address,
                 'ip_version': ip_version,
                 'ip_id': ip_id,
+                'ip_cidr': f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128",
+                'primary_field': primary_field,
                 'interface_id': interface_id,
                 'device_type': device_type_id,
                 'role': role_id,
                 'site': site_id,
                 'primary_ip_assigned': primary_ip_set,
+                'assign_error': assign_error,
                 'onboard_type': 'manual'
             }
         }), 201
