@@ -93,14 +93,12 @@ def setup_event_rule(webhook_id):
     data = api_get(f"/api/extras/event-rules/?name={EVENT_RULE_NAME}")
     existing = data.get('results', [])
 
-    # NetBox v4.2 accepts content_types as string list like ["dcim.device"]
+    # NetBox v4.2 uses object_types and event_types
     event_rule_payload = {
         'name': EVENT_RULE_NAME,
         'enabled': True,
-        'content_types': ['dcim.device'],
-        'type_create': True,
-        'type_update': True,
-        'type_delete': True,
+        'object_types': ['dcim.device'],
+        'event_types': ['object_created', 'object_updated', 'object_deleted'],
         'action_type': 'webhook',
         'action_object_type': 'extras.webhook',
         'action_object_id': webhook_id,
@@ -159,7 +157,8 @@ def verify_setup():
         er = rules[0]
         print(f"  Event Rule: {er['name']} (ID: {er['id']})")
         print(f"    Enabled: {er['enabled']}")
-        print(f"    Create: {er['type_create']}, Update: {er['type_update']}, Delete: {er['type_delete']}")
+        print(f"    Object Types: {er.get('object_types', [])}")
+        print(f"    Event Types: {er.get('event_types', [])}")
         print(f"    Action: {er['action_type']} -> {er.get('action_object_type', 'N/A')}")
     else:
         print("  [WARN] Event rule not found!")
