@@ -356,7 +356,16 @@ class NetBoxSetup:
         )
         if response.json()['count'] > 0:
             webhook_id = response.json()['results'][0]['id']
-            print(f"  Webhook '{webhook_data['name']}' already exists (ID: {webhook_id})")
+            print(f"  Webhook '{webhook_data['name']}' already exists (ID: {webhook_id}), updating...")
+            response = requests.patch(
+                f"{self.api_url}/extras/webhooks/{webhook_id}/",
+                headers=self.headers,
+                json=webhook_data
+            )
+            if response.status_code == 200:
+                print(f"  Updated webhook: {webhook_data['name']}")
+            else:
+                print(f"  WARNING: Failed to update webhook: {response.text}")
             return webhook_id
 
         response = requests.post(
