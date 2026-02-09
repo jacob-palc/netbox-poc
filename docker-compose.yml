@@ -61,7 +61,7 @@ services:
       # Device encryption key for onboarding
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
       # SSH Validation (validates SSH credentials directly via Paramiko)
-      SSH_VALIDATION_ENABLED: "true"
+      SSH_VALIDATION_ENABLED: "false"
       SSH_VALIDATION_PORT: "22"
       SSH_VALIDATION_TIMEOUT: "30"
       SSH_VALIDATION_COMMAND: "show version"
@@ -101,7 +101,7 @@ services:
       SECRET_KEY: "netbox-test-secret-key-change-in-production-at-least-50-chars"
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
       # SSH Validation
-      SSH_VALIDATION_ENABLED: "true"
+      SSH_VALIDATION_ENABLED: "false"
       SSH_VALIDATION_PORT: "22"
       SSH_VALIDATION_TIMEOUT: "30"
       SSH_VALIDATION_COMMAND: "show version"

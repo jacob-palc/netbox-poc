@@ -20,6 +20,11 @@ import requests
 from requests.adapters import HTTPAdapter
 import re
 import os
+import io
+import csv
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from cryptography.fernet import Fernet
 
@@ -36,12 +41,18 @@ HEADERS = {
     'Content-Type': 'application/json'
 }
 
-# Create a session with connection pooling
+# Create a session with connection pooling (sized for 15 bulk workers + single requests)
 session = requests.Session()
 session.headers.update(HEADERS)
-adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
+
+# Bulk onboard configuration
+BULK_MAX_WORKERS = int(os.environ.get('BULK_MAX_WORKERS', '15'))
+BULK_MAX_DEVICES = int(os.environ.get('BULK_MAX_DEVICES', '1000'))
+bulk_lock = threading.Lock()
+bulk_in_progress = False
 
 # Regex patterns
 MAC_PATTERN = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{4}\.){2}([0-9A-Fa-f]{4})$')
@@ -217,30 +228,14 @@ def check_mac_exists(mac_address):
 
 
 # =============================================================================
-# MANUAL ONBOARDING (IP Required)
+# CORE ONBOARDING LOGIC (reusable by single + bulk endpoints)
 # =============================================================================
-@app.route('/api/onboard', methods=['POST'])
-def onboard_device():
+def _onboard_manual(data):
     """
-    Manual Device Onboarding - IP address required
-
-    Primary Key: Device ID (auto-generated)
-    Unique Identifier: IP address (validated for duplicates)
-
-    Request Body:
-    {
-        "ip": "192.168.1.100",        # Required - IPv4 or IPv6
-        "device_type": 1,             # Required
-        "role": 1,                    # Required
-        "site": 1,                    # Optional (default: 1)
-        "username": "admin",          # Optional
-        "password": "secret123"       # Optional (encrypted)
-    }
+    Core manual onboarding logic. Returns (result_dict, status_code).
+    Thread-safe - can be called from ThreadPoolExecutor.
     """
     try:
-        data = request.get_json()
-
-        # Extract fields
         ip_address = data.get('ip', '').strip() if data.get('ip') else None
         device_type_id = data.get('device_type')
         role_id = data.get('role')
@@ -248,73 +243,49 @@ def onboard_device():
         username = data.get('username', '')
         password = data.get('password', '')
 
-        # ================== VALIDATION ==================
+        # Validation
         if not ip_address:
-            return jsonify({
-                'status': 'error',
-                'error': 'ip is required for manual onboarding',
-                'field': 'ip'
-            }), 400
+            return {'status': 'error', 'error': 'ip is required', 'field': 'ip'}, 400
 
         ip_version = detect_ip_version(ip_address)
         if not ip_version:
-            return jsonify({
-                'status': 'error',
-                'error': f'Invalid IP address format: {ip_address}',
-                'field': 'ip',
-                'hint': 'Must be valid IPv4 (192.168.1.100) or IPv6 (2001:db8::1)'
-            }), 400
+            return {'status': 'error', 'error': f'Invalid IP address format: {ip_address}', 'field': 'ip'}, 400
 
         if not device_type_id:
-            return jsonify({
-                'status': 'error',
-                'error': 'device_type is required',
-                'field': 'device_type'
-            }), 400
+            return {'status': 'error', 'error': 'device_type is required', 'field': 'device_type'}, 400
 
         if not role_id:
-            return jsonify({
-                'status': 'error',
-                'error': 'role is required',
-                'field': 'role'
-            }), 400
+            return {'status': 'error', 'error': 'role is required', 'field': 'role'}, 400
 
-        # ================== CHECK DUPLICATES ==================
-        # Check if device with this IP as name already exists
+        # Check duplicates
         device_check = check_device_exists(ip_address)
         if device_check['exists']:
-            return jsonify({
-                'status': 'error',
-                'error': 'Device already exists with this IP',
-                'field': 'ip',
-                'ip_address': ip_address,
+            return {
+                'status': 'error', 'error': 'Device already exists with this IP',
+                'field': 'ip', 'ip_address': ip_address,
                 'existing': {
                     'device_id': device_check.get('device_id'),
                     'device_name': device_check.get('device_name'),
                     'primary_ip': device_check.get('primary_ip')
                 }
-            }), 409
+            }, 409
 
-        # Check if IP address already exists
         ip_check = check_ip_exists(ip_address)
         if ip_check['exists']:
-            return jsonify({
-                'status': 'error',
-                'error': 'IP address already exists',
-                'field': 'ip',
-                'ip_address': ip_address,
+            return {
+                'status': 'error', 'error': 'IP address already exists',
+                'field': 'ip', 'ip_address': ip_address,
                 'existing': {
                     'ip_id': ip_check.get('ip_id'),
                     'device_id': ip_check.get('device_id'),
                     'device_name': ip_check.get('device_name')
                 }
-            }), 409
+            }, 409
 
-        # ================== CREATE DEVICE ==================
-        device_name = ip_address  # Use IP as display name
+        # Create device
+        device_name = ip_address
         encrypted_password = encrypt_password(password) if password else ''
 
-        # Custom fields - use 'username' and 'password' field names
         custom_fields = {}
         if username:
             custom_fields['username'] = username
@@ -330,36 +301,22 @@ def onboard_device():
             'custom_fields': custom_fields
         }
 
-        device_response = session.post(
-            f"{NETBOX_URL}/api/dcim/devices/",
-            json=device_payload
-        )
+        device_response = session.post(f"{NETBOX_URL}/api/dcim/devices/", json=device_payload)
 
         if device_response.status_code not in [200, 201] and 'custom field' in device_response.text.lower():
             del device_payload['custom_fields']
-            device_response = session.post(
-                f"{NETBOX_URL}/api/dcim/devices/",
-                json=device_payload
-            )
+            device_response = session.post(f"{NETBOX_URL}/api/dcim/devices/", json=device_payload)
 
         if device_response.status_code not in [200, 201]:
-            return jsonify({
-                'status': 'error',
-                'error': 'Failed to create device',
-                'details': device_response.text
-            }), 500
+            return {'status': 'error', 'error': 'Failed to create device', 'details': device_response.text}, 500
 
         device_data = device_response.json()
         device_id = device_data['id']
 
-        # ================== CREATE INTERFACE ==================
+        # Create interface
         interface_response = session.post(
             f"{NETBOX_URL}/api/dcim/interfaces/",
-            json={
-                'device': device_id,
-                'name': 'mgmt0',
-                'type': 'virtual'
-            }
+            json={'device': device_id, 'name': 'mgmt0', 'type': 'virtual'}
         )
 
         interface_id = None
@@ -369,21 +326,14 @@ def onboard_device():
         else:
             interface_error = interface_response.text
 
-        # ================== CREATE IP ADDRESS ==================
+        # Create IP address
         cidr = f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128"
-
-        ip_payload = {
-            'address': cidr,
-            'status': 'active'
-        }
+        ip_payload = {'address': cidr, 'status': 'active'}
         if interface_id:
             ip_payload['assigned_object_type'] = 'dcim.interface'
             ip_payload['assigned_object_id'] = interface_id
 
-        ip_response = session.post(
-            f"{NETBOX_URL}/api/ipam/ip-addresses/",
-            json=ip_payload
-        )
+        ip_response = session.post(f"{NETBOX_URL}/api/ipam/ip-addresses/", json=ip_payload)
 
         ip_id = None
         ip_create_error = None
@@ -392,7 +342,7 @@ def onboard_device():
         else:
             ip_create_error = ip_response.text
 
-        # ================== SET PRIMARY IP ==================
+        # Set primary IP
         primary_ip_set = False
         primary_field = 'primary_ip4' if ip_version == 'ipv4' else 'primary_ip6'
         assign_error = None
@@ -406,17 +356,16 @@ def onboard_device():
             if not primary_ip_set:
                 assign_error = assign_response.text
 
-        # ================== SUCCESS ==================
-        return jsonify({
+        return {
             'status': 'success',
             'message': 'Device onboarded successfully',
             'data': {
-                'device_id': device_id,          # PRIMARY KEY
+                'device_id': device_id,
                 'device_name': device_name,
                 'ip_address': ip_address,
                 'ip_version': ip_version,
                 'ip_id': ip_id,
-                'ip_cidr': f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128",
+                'ip_cidr': cidr,
                 'primary_field': primary_field,
                 'interface_id': interface_id,
                 'device_type': device_type_id,
@@ -428,139 +377,91 @@ def onboard_device():
                 'assign_error': assign_error,
                 'onboard_type': 'manual'
             }
-        }), 201
+        }, 201
 
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'error': str(e)
-        }), 500
+        return {'status': 'error', 'error': str(e)}, 500
 
 
-# =============================================================================
-# DHCP ONBOARDING (MAC Required) - Future Implementation
-# =============================================================================
-@app.route('/api/onboard/dhcp', methods=['POST'])
-def onboard_device_dhcp():
+def _onboard_dhcp(data):
     """
-    DHCP Device Onboarding - MAC address required
-
-    Primary Key: Device ID (auto-generated)
-    Unique Identifier: MAC address (validated for duplicates)
-
-    Request Body:
-    {
-        "mac": "AA:BB:CC:DD:EE:FF",    # Required - MAC address
-        "ip": "192.168.1.100",          # Optional - assigned by DHCP
-        "device_type": 1,               # Required
-        "role": 1,                      # Required
-        "site": 1,                      # Optional (default: 1)
-        "hostname": "device-001"        # Optional - DHCP hostname
-    }
+    Core DHCP onboarding logic. Returns (result_dict, status_code).
+    Thread-safe - can be called from ThreadPoolExecutor.
     """
     try:
-        data = request.get_json()
-
-        # Extract fields
         mac_address = data.get('mac', '').strip() if data.get('mac') else None
         ip_address = data.get('ip', '').strip() if data.get('ip') else None
         device_type_id = data.get('device_type')
         role_id = data.get('role')
         site_id = data.get('site', 1)
         hostname = data.get('hostname', '').strip() if data.get('hostname') else None
+        username = data.get('username', '')
+        password = data.get('password', '')
 
-        # ================== VALIDATION ==================
+        # Validation
         if not mac_address:
-            return jsonify({
-                'status': 'error',
-                'error': 'mac is required for DHCP onboarding',
-                'field': 'mac'
-            }), 400
+            return {'status': 'error', 'error': 'mac is required for DHCP onboarding', 'field': 'mac'}, 400
 
         if not is_valid_mac(mac_address):
-            return jsonify({
-                'status': 'error',
-                'error': f'Invalid MAC address format: {mac_address}',
-                'field': 'mac',
-                'hint': 'Must be valid MAC (AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF)'
-            }), 400
+            return {'status': 'error', 'error': f'Invalid MAC address format: {mac_address}', 'field': 'mac'}, 400
 
         mac_address = normalize_mac(mac_address)
 
         if not device_type_id:
-            return jsonify({
-                'status': 'error',
-                'error': 'device_type is required',
-                'field': 'device_type'
-            }), 400
+            return {'status': 'error', 'error': 'device_type is required', 'field': 'device_type'}, 400
 
         if not role_id:
-            return jsonify({
-                'status': 'error',
-                'error': 'role is required',
-                'field': 'role'
-            }), 400
+            return {'status': 'error', 'error': 'role is required', 'field': 'role'}, 400
 
-        # Validate IP if provided
         ip_version = None
         if ip_address:
             ip_version = detect_ip_version(ip_address)
             if not ip_version:
-                return jsonify({
-                    'status': 'error',
-                    'error': f'Invalid IP address format: {ip_address}',
-                    'field': 'ip'
-                }), 400
+                return {'status': 'error', 'error': f'Invalid IP address format: {ip_address}', 'field': 'ip'}, 400
 
-        # ================== CHECK DUPLICATE MAC (device name = MAC) ==================
-        # Check if device with name=MAC already exists
+        # Check duplicate MAC
         device_check = check_device_exists(mac_address)
         if device_check['exists']:
-            return jsonify({
-                'status': 'error',
-                'error': 'Device already exists with this MAC',
-                'field': 'mac',
-                'mac_address': mac_address,
+            return {
+                'status': 'error', 'error': 'Device already exists with this MAC',
+                'field': 'mac', 'mac_address': mac_address,
                 'existing': {
                     'device_id': device_check.get('device_id'),
                     'device_name': device_check.get('device_name'),
                     'primary_ip': device_check.get('primary_ip')
                 }
-            }), 409
+            }, 409
 
-        # ================== CHECK IP - ALLOW ONLY IF DEVICE IS DOWN ==================
-        # For DHCP: Same IP can be reassigned to different MAC ONLY if device is down
-        existing_ip_id = None  # Track if we're reassigning an existing IP
+        # Check IP reachability for reassignment
+        existing_ip_id = None
         if ip_address:
             ip_device_check = check_ip_device_reachable(ip_address)
             if ip_device_check['exists']:
                 if not ip_device_check['can_reassign']:
-                    return jsonify({
-                        'status': 'error',
-                        'error': 'IP is assigned to an active device',
-                        'field': 'ip',
-                        'ip_address': ip_address,
+                    return {
+                        'status': 'error', 'error': 'IP is assigned to an active device',
+                        'field': 'ip', 'ip_address': ip_address,
                         'existing': {
                             'device_id': ip_device_check.get('device_id'),
                             'device_name': ip_device_check.get('device_name'),
                             'device_reachable': ip_device_check.get('device_reachable'),
                             'reason': ip_device_check.get('reason')
-                        },
-                        'hint': 'IP can only be reassigned if the device is down (reachable=false)'
-                    }), 409
+                        }
+                    }, 409
                 else:
-                    # IP exists and can be reassigned - save the IP ID for later reassignment
                     existing_ip_id = ip_device_check.get('ip_id')
 
-        # ================== CREATE DEVICE ==================
-        # Always use MAC as device name (unique identifier for DHCP devices)
+        # Create device
         device_name = mac_address
+        encrypted_password = encrypt_password(password) if password else ''
 
-        # Custom fields
         custom_fields = {}
-        # hostname is just metadata, stored in custom field if provided
         if hostname:
             custom_fields['hostname'] = hostname
+        if username:
+            custom_fields['username'] = username
+        if encrypted_password:
+            custom_fields['password'] = encrypted_password
 
         device_payload = {
             'name': device_name,
@@ -571,38 +472,22 @@ def onboard_device_dhcp():
             'custom_fields': custom_fields
         }
 
-        device_response = session.post(
-            f"{NETBOX_URL}/api/dcim/devices/",
-            json=device_payload
-        )
+        device_response = session.post(f"{NETBOX_URL}/api/dcim/devices/", json=device_payload)
 
         if device_response.status_code not in [200, 201] and 'custom field' in device_response.text.lower():
             del device_payload['custom_fields']
-            device_response = session.post(
-                f"{NETBOX_URL}/api/dcim/devices/",
-                json=device_payload
-            )
+            device_response = session.post(f"{NETBOX_URL}/api/dcim/devices/", json=device_payload)
 
         if device_response.status_code not in [200, 201]:
-            return jsonify({
-                'status': 'error',
-                'error': 'Failed to create device',
-                'details': device_response.text
-            }), 500
+            return {'status': 'error', 'error': 'Failed to create device', 'details': device_response.text}, 500
 
         device_data = device_response.json()
         device_id = device_data['id']
 
-        # ================== CREATE INTERFACE WITH MAC ==================
-        # Use 'other' type which supports MAC addresses (virtual type doesn't)
+        # Create interface with MAC
         interface_response = session.post(
             f"{NETBOX_URL}/api/dcim/interfaces/",
-            json={
-                'device': device_id,
-                'name': 'eth0',
-                'type': 'other',
-                'mac_address': mac_address
-            }
+            json={'device': device_id, 'name': 'eth0', 'type': 'other', 'mac_address': mac_address}
         )
 
         interface_id = None
@@ -615,7 +500,7 @@ def onboard_device_dhcp():
         else:
             interface_error = interface_response.text
 
-        # ================== HANDLE IP ADDRESS (if provided) ==================
+        # Handle IP address
         ip_id = None
         ip_create_error = None
         ip_reassigned = False
@@ -623,9 +508,7 @@ def onboard_device_dhcp():
         assign_error = None
 
         if ip_address and interface_id:
-            # Check if we're reassigning an existing IP or creating new
             if existing_ip_id:
-                # REASSIGN: Update existing IP to point to new interface
                 reassign_response = session.patch(
                     f"{NETBOX_URL}/api/ipam/ip-addresses/{existing_ip_id}/",
                     json={
@@ -640,7 +523,6 @@ def onboard_device_dhcp():
                 else:
                     ip_create_error = f"Failed to reassign IP: {reassign_response.text}"
             else:
-                # CREATE: New IP address
                 cidr = f"{ip_address}/32" if ip_version == 'ipv4' else f"{ip_address}/128"
                 ip_payload = {
                     'address': cidr,
@@ -648,18 +530,12 @@ def onboard_device_dhcp():
                     'assigned_object_type': 'dcim.interface',
                     'assigned_object_id': interface_id
                 }
-
-                ip_response = session.post(
-                    f"{NETBOX_URL}/api/ipam/ip-addresses/",
-                    json=ip_payload
-                )
-
+                ip_response = session.post(f"{NETBOX_URL}/api/ipam/ip-addresses/", json=ip_payload)
                 if ip_response.status_code in [200, 201]:
                     ip_id = ip_response.json()['id']
                 else:
                     ip_create_error = ip_response.text
 
-            # Set as primary IP if we have an IP
             if ip_id:
                 primary_field = 'primary_ip4' if ip_version == 'ipv4' else 'primary_ip6'
                 assign_response = session.patch(
@@ -670,12 +546,11 @@ def onboard_device_dhcp():
                 if not primary_ip_set:
                     assign_error = assign_response.text
 
-        # ================== SUCCESS ==================
-        return jsonify({
+        return {
             'status': 'success',
             'message': 'Device onboarded via DHCP successfully',
             'data': {
-                'device_id': device_id,          # PRIMARY KEY
+                'device_id': device_id,
                 'device_name': device_name,
                 'mac_address': mac_address,
                 'interface_mac': interface_mac,
@@ -693,13 +568,176 @@ def onboard_device_dhcp():
                 'assign_error': assign_error,
                 'onboard_type': 'dhcp'
             }
-        }), 201
+        }, 201
 
     except Exception as e:
+        return {'status': 'error', 'error': str(e)}, 500
+
+
+# =============================================================================
+# MANUAL ONBOARDING (IP Required)
+# =============================================================================
+@app.route('/api/onboard', methods=['POST'])
+def onboard_device():
+    """Manual Device Onboarding - IP address required"""
+    data = request.get_json()
+    result, status_code = _onboard_manual(data)
+    return jsonify(result), status_code
+
+
+# =============================================================================
+# DHCP ONBOARDING (MAC Required) - Future Implementation
+# =============================================================================
+@app.route('/api/onboard/dhcp', methods=['POST'])
+def onboard_device_dhcp():
+    """DHCP Device Onboarding - MAC address required"""
+    data = request.get_json()
+    result, status_code = _onboard_dhcp(data)
+    return jsonify(result), status_code
+
+
+# =============================================================================
+# BULK ONBOARDING
+# =============================================================================
+def _process_single_device(index, device_data):
+    """Process a single device for bulk onboarding. Returns (index, result, status_code)."""
+    # Determine onboard type: if 'mac' is present and no 'ip', use DHCP
+    has_mac = bool(device_data.get('mac', '').strip() if device_data.get('mac') else None)
+    has_ip = bool(device_data.get('ip', '').strip() if device_data.get('ip') else None)
+
+    if has_mac and not has_ip:
+        result, status_code = _onboard_dhcp(device_data)
+    else:
+        result, status_code = _onboard_manual(device_data)
+
+    return index, result, status_code
+
+
+def _parse_csv_devices(csv_text):
+    """Parse CSV text into list of device dicts."""
+    devices = []
+    reader = csv.DictReader(io.StringIO(csv_text))
+    for row in reader:
+        device = {}
+        for key, value in row.items():
+            if value is None or value.strip() == '':
+                continue
+            key = key.strip().lower()
+            # Convert numeric fields
+            if key in ('device_type', 'role', 'site'):
+                try:
+                    device[key] = int(value.strip())
+                except ValueError:
+                    device[key] = value.strip()
+            else:
+                device[key] = value.strip()
+        if device:
+            devices.append(device)
+    return devices
+
+
+@app.route('/api/onboard/bulk', methods=['POST'])
+def onboard_bulk():
+    """
+    Bulk Device Onboarding - JSON array or CSV
+
+    Accepts:
+      1. JSON: {"devices": [{...}, {...}]}
+      2. CSV file upload (multipart/form-data, field name: "file")
+      3. CSV text in body (Content-Type: text/csv)
+
+    Each device follows manual or DHCP onboarding rules:
+      - Has 'ip' → manual onboard
+      - Has 'mac' without 'ip' → DHCP onboard
+
+    Uses 15 parallel workers. Only one bulk operation at a time.
+    """
+    global bulk_in_progress
+
+    # Prevent concurrent bulk operations
+    if not bulk_lock.acquire(blocking=False):
         return jsonify({
             'status': 'error',
-            'error': str(e)
-        }), 500
+            'error': 'Another bulk onboarding operation is in progress'
+        }), 429
+
+    try:
+        bulk_in_progress = True
+        start_time = time.time()
+
+        # Parse input - JSON, CSV file upload, or CSV text
+        devices = []
+        content_type = request.content_type or ''
+
+        if 'multipart/form-data' in content_type:
+            # CSV file upload
+            file = request.files.get('file')
+            if not file:
+                return jsonify({'status': 'error', 'error': 'No file uploaded. Use field name "file"'}), 400
+            csv_text = file.read().decode('utf-8')
+            devices = _parse_csv_devices(csv_text)
+        elif 'text/csv' in content_type:
+            # CSV text in body
+            csv_text = request.get_data(as_text=True)
+            devices = _parse_csv_devices(csv_text)
+        else:
+            # JSON
+            data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'error': 'Request body is empty'}), 400
+            devices = data.get('devices', [])
+
+        if not devices:
+            return jsonify({'status': 'error', 'error': 'No devices provided'}), 400
+
+        if len(devices) > BULK_MAX_DEVICES:
+            return jsonify({
+                'status': 'error',
+                'error': f'Too many devices. Maximum is {BULK_MAX_DEVICES}, got {len(devices)}'
+            }), 400
+
+        # Process devices in parallel
+        results = [{}] * len(devices)
+        successful = 0
+        failed = 0
+
+        with ThreadPoolExecutor(max_workers=BULK_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_process_single_device, i, device): i
+                for i, device in enumerate(devices)
+            }
+
+            for future in as_completed(futures):
+                index, result, status_code = future.result()
+                # Build clean result entry with index info
+                entry = dict(result)
+                entry['_index'] = str(index)
+                entry['_status_code'] = str(status_code)
+                results[index] = entry
+
+                if result.get('status') == 'success':
+                    successful += 1
+                else:
+                    failed += 1
+
+        elapsed = round(time.time() - start_time, 2)
+
+        return jsonify({
+            'status': 'completed',
+            'total': len(devices),
+            'successful': successful,
+            'failed': failed,
+            'elapsed_seconds': elapsed,
+            'workers': BULK_MAX_WORKERS,
+            'results': results
+        }), 200 if failed == 0 else 207  # 207 Multi-Status if partial failures
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+    finally:
+        bulk_in_progress = False
+        bulk_lock.release()
 
 
 # =============================================================================
@@ -819,11 +857,12 @@ def index():
     """API documentation"""
     return jsonify({
         'service': 'Device Onboarding API',
-        'version': '2.0',
+        'version': '3.0',
         'primary_key': 'device_id (auto-generated by NetBox)',
         'endpoints': {
             'POST /api/onboard': 'Manual onboarding (IP required)',
             'POST /api/onboard/dhcp': 'DHCP onboarding (MAC required)',
+            'POST /api/onboard/bulk': 'Bulk onboarding (JSON or CSV)',
             'POST /api/validate/ip': 'Check if IP exists',
             'POST /api/validate/mac': 'Check if MAC exists',
             'GET /api/device-types': 'List device types',
@@ -852,6 +891,19 @@ def index():
                 'site': '1 (Optional)',
                 'hostname': 'device-001 (Optional)'
             }
+        },
+        'bulk_onboard': {
+            'endpoint': 'POST /api/onboard/bulk',
+            'workers': BULK_MAX_WORKERS,
+            'max_devices': BULK_MAX_DEVICES,
+            'formats': ['JSON', 'CSV file upload', 'CSV text'],
+            'json_payload': {
+                'devices': [
+                    {'ip': '192.168.1.10', 'device_type': 1, 'role': 1, 'username': 'admin', 'password': 'pass'},
+                    {'mac': 'AA:BB:CC:DD:EE:FF', 'device_type': 1, 'role': 1}
+                ]
+            },
+            'csv_headers': 'ip,device_type,role,site,username,password,mac,hostname'
         }
     })
 
@@ -859,10 +911,11 @@ def index():
 if __name__ == '__main__':
     print(f"""
 ================================================================================
-Device Onboarding API Service v2.0
+Device Onboarding API Service v3.0
 ================================================================================
 NetBox URL: {NETBOX_URL}
 Primary Key: device_id (auto-generated by NetBox)
+Bulk Workers: {BULK_MAX_WORKERS} | Max Devices: {BULK_MAX_DEVICES}
 
 ENDPOINTS:
 ---------------------------------------------------------------------------
@@ -874,6 +927,11 @@ DHCP Onboarding (MAC required):
   POST /api/onboard/dhcp
   Payload: {{"mac": "AA:BB:CC:DD:EE:FF", "device_type": 1, "role": 1}}
 
+Bulk Onboarding (JSON or CSV):
+  POST /api/onboard/bulk
+  JSON:  {{"devices": [{{"ip": "192.168.1.10", "device_type": 1, "role": 1}}]}}
+  CSV:   curl -F "file=@devices.csv" http://localhost:5001/api/onboard/bulk
+
 Validation:
   POST /api/validate/ip   - Check if IP exists
   POST /api/validate/mac  - Check if MAC exists
@@ -883,23 +941,6 @@ Helpers:
   GET /api/device-roles   - List device roles
   GET /api/sites          - List sites
   GET /health             - Health check
----------------------------------------------------------------------------
-
-EXAMPLES:
-  # Manual onboard with IP
-  curl -X POST http://localhost:5001/api/onboard \\
-    -H "Content-Type: application/json" \\
-    -d '{{"ip": "192.168.1.100", "device_type": 1, "role": 1}}'
-
-  # DHCP onboard with MAC
-  curl -X POST http://localhost:5001/api/onboard/dhcp \\
-    -H "Content-Type: application/json" \\
-    -d '{{"mac": "AA:BB:CC:DD:EE:FF", "device_type": 1, "role": 1}}'
-
-  # Validate IP before creating
-  curl -X POST http://localhost:5001/api/validate/ip \\
-    -H "Content-Type: application/json" \\
-    -d '{{"ip": "192.168.1.100"}}'
 ================================================================================
 """)
     app.run(host='0.0.0.0', port=5001, debug=True)
