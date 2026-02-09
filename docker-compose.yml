@@ -106,17 +106,6 @@ services:
       SSH_VALIDATION_TIMEOUT: "30"
       SSH_VALIDATION_COMMAND: "show version"
 
-  # Mock Telemetry Service (to test webhooks)
-  telemetry-mock:
-    build:
-      context: .
-      dockerfile: Dockerfile.telemetry-mock
-    container_name: telemetry-mock
-    ports:
-      - "5000:5000"
-    environment:
-      NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
-
   # Device Onboarding API (single-call device creation with IP)
   onboarding-api:
     build:
