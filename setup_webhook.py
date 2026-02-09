@@ -50,15 +50,6 @@ def api_delete(path):
     return r
 
 
-def get_content_type_id(app_label, model):
-    """Get the content type ID for dcim.device"""
-    data = api_get(f"/api/extras/content-types/?app_label={app_label}&model={model}")
-    results = data.get('results', [])
-    if results:
-        return results[0]['id']
-    return None
-
-
 def setup_webhook():
     """Create or update the webhook."""
     # Check if webhook already exists
@@ -98,21 +89,15 @@ def setup_webhook():
 
 def setup_event_rule(webhook_id):
     """Create or update the event rule that triggers the webhook on device changes."""
-    # Get content type ID for dcim.device
-    ct_id = get_content_type_id('dcim', 'device')
-    if not ct_id:
-        print("[ERROR] Could not find content type for dcim.device")
-        sys.exit(1)
-    print(f"  Content type dcim.device ID: {ct_id}")
-
     # Check if event rule already exists
     data = api_get(f"/api/extras/event-rules/?name={EVENT_RULE_NAME}")
     existing = data.get('results', [])
 
+    # NetBox v4.2 accepts content_types as string list like ["dcim.device"]
     event_rule_payload = {
         'name': EVENT_RULE_NAME,
         'enabled': True,
-        'content_types': [f'dcim.device'],
+        'content_types': ['dcim.device'],
         'type_create': True,
         'type_update': True,
         'type_delete': True,
@@ -130,6 +115,14 @@ def setup_event_rule(webhook_id):
             return rule_id
         else:
             print(f"  -> Failed to update: {r.status_code} {r.text}")
+            print(f"  -> Trying without action_object_type...")
+            # Some NetBox versions don't accept action_object_type on PATCH
+            del event_rule_payload['action_object_type']
+            r = api_patch(f"/api/extras/event-rules/{rule_id}/", event_rule_payload)
+            if r.status_code == 200:
+                print(f"  -> Updated event rule (retry succeeded)")
+                return rule_id
+            print(f"  -> Retry failed: {r.status_code} {r.text}")
             sys.exit(1)
     else:
         print(f"[CREATE] Creating event rule '{EVENT_RULE_NAME}'...")
