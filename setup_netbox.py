@@ -326,26 +326,7 @@ class NetBoxSetup:
             'http_method': 'POST',
             'http_content_type': 'application/json',
             'ssl_verification': False,  # For testing with mock service
-            'body_template': '''{
-  "event": "device.{% if snapshots.prechange %}updated{% else %}onboarded{% endif %}",
-  "timestamp": "{{ timestamp }}",
-  "data": {
-    "device_id": {{ data.id }},
-    "device_name": "{{ data.name }}",
-    "ip_address": "{% if data.primary_ip4 %}{{ data.primary_ip4.address }}{% else %}null{% endif %}",
-    "username": "{{ data.custom_fields.username | default('', true) }}",
-    "password": "{{ data.custom_fields.password | default('', true) }}",
-    "device_role": "{{ data.role.name }}",
-    "device_type": "{{ data.device_type.manufacturer.name }} {{ data.device_type.model }}",
-    "manufacturer": "{{ data.device_type.manufacturer.name }}",
-    "model": "{{ data.device_type.model }}",
-    "site": "{{ data.site.name }}",
-    "status": "{{ data.status.value }}",
-    "reachable": {% if data.custom_fields.reachable is not none %}{{ data.custom_fields.reachable | lower }}{% else %}null{% endif %},
-    "authentication": {% if data.custom_fields.authentication is not none %}{{ data.custom_fields.authentication | lower }}{% else %}null{% endif %},
-    "management": {% if data.custom_fields.management is not none %}{{ data.custom_fields.management | lower }}{% else %}null{% endif %}
-  }
-}'''
+            'body_template': ''
         }
 
         # Check if webhook exists
