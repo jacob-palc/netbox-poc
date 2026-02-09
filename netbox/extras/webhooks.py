@@ -9,7 +9,7 @@ from jinja2.exceptions import TemplateError
 from netbox.registry import registry
 from utilities.proxy import resolve_proxies
 from .constants import WEBHOOK_EVENT_TYPES
-from .server2_client import validate_device_with_server2
+from .ssh_validator import validate_device_ssh
 
 __all__ = (
     'generate_signature',
@@ -91,22 +91,22 @@ def send_webhook(event_rule, object_type, event_type, data, timestamp, username,
         logger.error(f"Error rendering request body for webhook {webhook}: {e}")
         raise e
 
-    # Server2 Validation: For device creation events, validate SSH before sending to telemetry
-    # This prevents generating telemetry configs for devices with invalid SSH credentials
+    # SSH Validation: For device creation events, validate SSH credentials directly
+    # before sending webhook to telemetry
     if object_type.model == 'device' and event_type == 'created':
-        logger.info(f"Validating device with Server2 before sending webhook")
-        validation_result = validate_device_with_server2(data)
-        
+        logger.info(f"Validating device SSH credentials before sending webhook")
+        validation_result = validate_device_ssh(data)
+
         if not validation_result['success']:
             logger.warning(
-                f"Server2 validation failed for device {data.get('name', 'unknown')}: "
+                f"SSH validation failed for device {data.get('name', 'unknown')}: "
                 f"{validation_result['message']} (status: {validation_result['status_code']})"
             )
             # Return early - do not send webhook to telemetry
-            return f"Server2 validation failed: {validation_result['message']}"
-        
+            return f"SSH validation failed: {validation_result['message']}"
+
         logger.info(
-            f"Server2 validation successful for device {data.get('name', 'unknown')}: "
+            f"SSH validation successful for device {data.get('name', 'unknown')}: "
             f"{validation_result['message']}"
         )
 

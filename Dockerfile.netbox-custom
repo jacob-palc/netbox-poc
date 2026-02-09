@@ -1,9 +1,12 @@
 FROM netboxcommunity/netbox:v4.2
 
-# Copy custom Server2 validation files
-COPY netbox/extras/server2_client.py /opt/netbox/netbox/extras/server2_client.py
+# Install paramiko for direct SSH validation
+RUN /opt/netbox/venv/bin/pip install paramiko
+
+# Copy custom SSH validation and webhook files
+COPY netbox/extras/ssh_validator.py /opt/netbox/netbox/extras/ssh_validator.py
 COPY netbox/extras/webhooks.py /opt/netbox/netbox/extras/webhooks.py
 
 # Set proper permissions
-RUN chown unit:root /opt/netbox/netbox/extras/server2_client.py && \
+RUN chown unit:root /opt/netbox/netbox/extras/ssh_validator.py && \
     chown unit:root /opt/netbox/netbox/extras/webhooks.py

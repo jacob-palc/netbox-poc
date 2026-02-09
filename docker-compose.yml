@@ -28,7 +28,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # NetBox Application (custom build with Server2 validation)
+  # NetBox Application (custom build with SSH validation)
   netbox:
     build:
       context: .
@@ -60,13 +60,11 @@ services:
       SUPERUSER_API_TOKEN: 0123456789abcdef0123456789abcdef01234567
       # Device encryption key for onboarding
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
-      # Server2 NMS Validation (validates SSH before telemetry config)
-      SERVER2_VALIDATION_ENABLED: "true"
-      SERVER2_BASE_URL: "http://10.4.160.240:5000"
-      SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
-      SERVER2_DEVICE_ENDPOINT: "/device"
-      SERVER2_USERNAME: "admin"
-      SERVER2_PASSWORD: "admin"
+      # SSH Validation (validates SSH credentials directly via Paramiko)
+      SSH_VALIDATION_ENABLED: "true"
+      SSH_VALIDATION_PORT: "22"
+      SSH_VALIDATION_TIMEOUT: "30"
+      SSH_VALIDATION_COMMAND: "show version"
       # Skip startup scripts that might fail
       SKIP_SUPERUSER: "false"
     ports:
@@ -102,13 +100,11 @@ services:
       REDIS_DATABASE: 0
       SECRET_KEY: "netbox-test-secret-key-change-in-production-at-least-50-chars"
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
-      # Server2 NMS Validation
-      SERVER2_VALIDATION_ENABLED: "true"
-      SERVER2_BASE_URL: "http://10.4.160.240:5000"
-      SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
-      SERVER2_DEVICE_ENDPOINT: "/device"
-      SERVER2_USERNAME: "admin"
-      SERVER2_PASSWORD: "admin"
+      # SSH Validation
+      SSH_VALIDATION_ENABLED: "true"
+      SSH_VALIDATION_PORT: "22"
+      SSH_VALIDATION_TIMEOUT: "30"
+      SSH_VALIDATION_COMMAND: "show version"
 
   # Mock Telemetry Service (to test webhooks)
   telemetry-mock:
@@ -135,29 +131,6 @@ services:
       NETBOX_URL: "http://netbox:8080"
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
-
-  # Webhook Handler (Server2 SSH validation -> Server1 Telemetry)
-  webhook-handler:
-    build:
-      context: .
-      dockerfile: Dockerfile.webhook-handler
-    container_name: webhook-handler
-    depends_on:
-      - netbox
-    ports:
-      - "5002:5002"
-    environment:
-      # Server2 (SSH Validation)
-      SERVER2_BASE_URL: "http://10.4.160.240:5000"
-      SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
-      SERVER2_DEVICE_ENDPOINT: "/device"
-      SERVER2_USERNAME: "admin"
-      SERVER2_PASSWORD: "admin"
-      # Server1 (Telemetry)
-      SERVER1_WEBHOOK_URL: "http://172.27.1.70:5000/endpoint"
-      # Encryption key
-      NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
-    restart: unless-stopped
 
   # Device Reachability Monitor (continuous ping monitoring)
   device-monitor:
