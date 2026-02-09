@@ -24,7 +24,7 @@ import sys
 # Default configuration
 DEFAULT_NETBOX_URL = "http://localhost:8000"
 DEFAULT_API_TOKEN = "0123456789abcdef0123456789abcdef01234567"
-DEFAULT_TELEMETRY_URL = "http://172.27.1.67:5000/endpoint"
+DEFAULT_TELEMETRY_URL = "http://172.27.1.70:5000/endpoint"
 
 
 class NetBoxSetup:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Setup NetBox Webhook + Event Rule via API.
-Points to the telemetry agent at http://172.27.1.70:5000/endpoint.
+Setup NetBox: base data + Webhook + Event Rule via API.
+Creates site, manufacturer, device type, device role, custom fields,
+then configures webhook to telemetry at http://172.27.1.70:5000/endpoint.
 
 Usage:
     python setup_webhook.py
