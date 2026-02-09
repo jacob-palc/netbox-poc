@@ -1,7 +1,8 @@
 FROM netboxcommunity/netbox:v4.2
 
 # Install paramiko for direct SSH validation
-RUN pip install paramiko || python3 -m pip install paramiko
+RUN /opt/netbox/venv/bin/python3 -m ensurepip && \
+    /opt/netbox/venv/bin/python3 -m pip install paramiko
 
 # Copy custom SSH validation and webhook files
 COPY netbox/extras/ssh_validator.py /opt/netbox/netbox/extras/ssh_validator.py
