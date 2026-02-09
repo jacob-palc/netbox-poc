@@ -1,16 +1,10 @@
 FROM netboxcommunity/netbox:v4.2
 
-USER root
-
-# Install paramiko for direct SSH validation
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip && \
+# Install paramiko into the venv via get-pip.py bootstrap
+RUN /opt/netbox/venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')" && \
+    /opt/netbox/venv/bin/python3 /tmp/get-pip.py && \
     /opt/netbox/venv/bin/python3 -m pip install paramiko && \
-    apt-get purge -y python3-pip && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
-
-USER unit
+    rm /tmp/get-pip.py
 
 # Copy custom SSH validation and webhook files
 COPY netbox/extras/ssh_validator.py /opt/netbox/netbox/extras/ssh_validator.py
