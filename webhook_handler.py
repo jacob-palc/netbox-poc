@@ -23,6 +23,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
+import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.fernet import Fernet
@@ -41,6 +42,12 @@ CORS(app)
 # 15 workers = up to 15 parallel SSH validations via Server2
 MAX_WORKERS = int(os.environ.get('WEBHOOK_MAX_WORKERS', '15'))
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# Deduplication: prevent infinite webhook loops
+# When we update NetBox (reachable/authentication), it fires another "updated" webhook.
+# We skip processing if the same device was already handled within DEDUP_WINDOW seconds.
+DEDUP_WINDOW = int(os.environ.get('WEBHOOK_DEDUP_WINDOW', '10'))
+_recently_processed = {}  # device_id -> timestamp
 
 # Server2 Configuration (SSH Validation)
 SERVER2_BASE_URL = os.environ.get('SERVER2_BASE_URL', 'http://10.4.160.240:8081')
@@ -295,7 +302,7 @@ def build_telemetry_payload(device_info, event, timestamp):
         'status': device_info['status'] or '',
         'model': device_info['model'],
         'manufacturer': device_info['manufacturer'],
-        'role': device_info['role'],
+        'role': device_info['role'].lower() if device_info['role'] else '',
         'site': device_info['site'],
     }
 
@@ -418,6 +425,22 @@ def handle_webhook():
                 'device_id': device_info['id'],
                 'device_name': device_info['name']
             }), 200
+
+        # Dedup: skip if we already processed this device recently
+        # (our own NetBox update of reachable/authentication triggers another webhook)
+        device_id = device_info['id']
+        now = time.time()
+        last_processed = _recently_processed.get(device_id, 0)
+        if now - last_processed < DEDUP_WINDOW:
+            logger.info(f"Skipping device {device_id} - already processed {now - last_processed:.1f}s ago (dedup)")
+            return jsonify({
+                'status': 'skipped',
+                'reason': 'recently processed (dedup)',
+                'device_id': device_id
+            }), 200
+
+        # Mark as processing now (before queuing to thread pool)
+        _recently_processed[device_id] = now
 
         # Submit to thread pool for background processing
         executor.submit(process_device_validation, device_info, event, timestamp)
