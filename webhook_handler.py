@@ -223,7 +223,11 @@ class Server2Client:
 
 
 def extract_device_info(webhook_data):
-    """Extract all device information from webhook payload"""
+    """Extract device information from webhook payload.
+
+    Also preserves the original 'data' dict so we can pass it through
+    to telemetry unchanged (the Go service expects the exact NetBox structure).
+    """
     data = webhook_data.get('data', {})
 
     # Get IP address
@@ -283,37 +287,37 @@ def extract_device_info(webhook_data):
         'manufacturer': manufacturer.get('name', ''),
         'role': role.get('name', ''),
         'site': site.get('name', ''),
+        # Preserve original data for telemetry pass-through
+        'raw_data': data,
     }
 
 
 def build_telemetry_payload(device_info, event, timestamp):
     """
-    Build payload matching the original NetBox webhook structure.
-    The Go telemetry service reads: data.role.name, data.site.name, etc.
+    Build payload by passing through the ORIGINAL NetBox webhook data.
+
+    The Go telemetry service expects the exact NetBox webhook structure:
+      data.role.slug, data.site.name, data.device_type.manufacturer.slug, etc.
+
+    Instead of reconstructing (and losing fields like slug/id/url), we pass
+    through the original 'data' dict from the webhook, only updating
+    custom_fields with the latest validation results.
     """
-    ip = device_info['ip_address'] or ''
+    import copy
+    raw_data = copy.deepcopy(device_info.get('raw_data', {}))
+
+    # Update custom_fields with validation results (reachable/authentication)
+    if 'custom_fields' not in raw_data:
+        raw_data['custom_fields'] = {}
+    raw_data['custom_fields']['reachable'] = device_info['reachable']
+    raw_data['custom_fields']['authentication'] = device_info['authentication']
+    raw_data['custom_fields']['management'] = device_info['management']
+
     return {
         'event': event,
         'timestamp': timestamp,
-        'data': {
-            'id': device_info['id'],
-            'name': device_info['name'],
-            'primary_ip4': {'address': f"{ip}/32"} if ip else None,
-            'device_type': {
-                'model': device_info['model'],
-                'manufacturer': {'name': device_info['manufacturer']}
-            },
-            'role': {'name': device_info['role'].lower() if device_info['role'] else ''},
-            'site': {'name': device_info['site']},
-            'status': {'value': device_info['status'] or ''},
-            'custom_fields': {
-                'username': device_info['username'] or None,
-                'password': device_info['password'] or None,
-                'reachable': device_info['reachable'],
-                'authentication': device_info['authentication'],
-                'management': device_info['management'],
-            }
-        }
+        'model': 'dcim.device',
+        'data': raw_data,
     }
 
 
