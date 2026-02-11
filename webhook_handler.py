@@ -287,7 +287,7 @@ def extract_device_info(webhook_data):
 
 
 def build_telemetry_payload(device_info, event, timestamp):
-    """Build a clean payload for the telemetry service"""
+    """Build payload for the telemetry service (Go struct expects nested objects)"""
     return {
         'event': event,
         'timestamp': timestamp,
@@ -299,11 +299,12 @@ def build_telemetry_payload(device_info, event, timestamp):
         'reachable': device_info['reachable'],
         'authentication': device_info['authentication'],
         'management': device_info['management'],
-        'status': device_info['status'] or '',
+        'status': {'value': device_info['status'] or ''},
         'model': device_info['model'],
-        'manufacturer': device_info['manufacturer'],
-        'role': device_info['role'].lower() if device_info['role'] else '',
-        'site': device_info['site'],
+        'manufacturer': {'name': device_info['manufacturer']},
+        'device_type': {'model': device_info['model'], 'manufacturer': {'name': device_info['manufacturer']}},
+        'role': {'name': device_info['role'].lower() if device_info['role'] else ''},
+        'site': {'name': device_info['site']},
     }
 
 
