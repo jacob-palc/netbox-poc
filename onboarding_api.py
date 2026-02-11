@@ -841,6 +841,74 @@ def get_sites():
     return jsonify([]), response.status_code
 
 
+@app.route('/api/devices/status', methods=['POST'])
+def device_status():
+    """
+    Get validation status for a list of device IDs.
+    Frontend polls this after bulk onboard to track reachable/authentication progress.
+
+    Request:  {"device_ids": [30, 31, 29]}
+    Response: {
+        "devices": [
+            {"id": 30, "name": "192.168.1.171", "reachable": true, "authentication": true, "status": "validated"},
+            {"id": 31, "name": "192.168.1.172", "reachable": null, "authentication": null, "status": "pending"},
+            ...
+        ],
+        "summary": {"total": 3, "validated": 1, "pending": 2, "unreachable": 0, "auth_failed": 0}
+    }
+    """
+    data = request.get_json()
+    device_ids = data.get('device_ids', [])
+
+    if not device_ids:
+        return jsonify({'error': 'device_ids required'}), 400
+
+    devices = []
+    summary = {'total': len(device_ids), 'validated': 0, 'pending': 0, 'unreachable': 0, 'auth_failed': 0}
+
+    for device_id in device_ids:
+        try:
+            resp = session.get(f"{NETBOX_URL}/api/dcim/devices/{device_id}/")
+            if resp.status_code != 200:
+                devices.append({'id': device_id, 'error': 'not found'})
+                continue
+
+            device = resp.json()
+            cf = device.get('custom_fields', {}) or {}
+            reachable = cf.get('reachable')
+            authentication = cf.get('authentication')
+
+            # Determine status
+            if reachable is None and authentication is None:
+                status = 'pending'
+                summary['pending'] += 1
+            elif reachable is False:
+                status = 'unreachable'
+                summary['unreachable'] += 1
+            elif reachable is True and authentication is False:
+                status = 'auth_failed'
+                summary['auth_failed'] += 1
+            elif reachable is True and authentication is True:
+                status = 'validated'
+                summary['validated'] += 1
+            else:
+                status = 'pending'
+                summary['pending'] += 1
+
+            devices.append({
+                'id': device_id,
+                'name': device.get('name', ''),
+                'reachable': reachable,
+                'authentication': authentication,
+                'management': cf.get('management'),
+                'status': status
+            })
+        except Exception as e:
+            devices.append({'id': device_id, 'error': str(e)})
+
+    return jsonify({'devices': devices, 'summary': summary})
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
@@ -865,6 +933,7 @@ def index():
             'POST /api/onboard/bulk': 'Bulk onboarding (JSON or CSV)',
             'POST /api/validate/ip': 'Check if IP exists',
             'POST /api/validate/mac': 'Check if MAC exists',
+            'POST /api/devices/status': 'Get validation status for device IDs (poll after bulk)',
             'GET /api/device-types': 'List device types',
             'GET /api/device-roles': 'List device roles',
             'GET /api/sites': 'List sites',

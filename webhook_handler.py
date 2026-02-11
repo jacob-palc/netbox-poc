@@ -3,22 +3,20 @@
 Webhook Handler Service
 
 Receives webhooks from NetBox and orchestrates the flow:
-1. Device Created → Server2 (SSH validation) → If success → Server1 (Telemetry)
-2. Device Updated → Server1 (Telemetry) directly
+  1. Has IP + credentials → Server2 (SSH validation) → Update NetBox fields → Telemetry
+  2. Has IP, no credentials → Telemetry directly
+  3. No IP → Skip (device data incomplete)
+
+After Server2 validation, updates NetBox custom fields:
+  - reachable: true/false (was device reachable?)
+  - authentication: true/false (did SSH credentials work?)
 
 Environment Variables:
-    # Server2 (SSH Validation)
-    SERVER2_BASE_URL: Server2 URL (default: http://10.4.160.240:8081)
-    SERVER2_AUTH_ENDPOINT: Auth endpoint (default: /api/auth/signin)
-    SERVER2_DEVICE_ENDPOINT: Device endpoint (default: /device)
-    SERVER2_USERNAME: Username for auth (default: admin)
-    SERVER2_PASSWORD: Password for auth (default: admin)
-
-    # Server1 (Telemetry)
-    SERVER1_WEBHOOK_URL: Telemetry URL (default: http://172.27.1.70:5000/endpoint)
-
-    # Encryption
-    NETBOX_DEVICE_ENCRYPTION_KEY: Key to decrypt device passwords
+    SERVER2_BASE_URL, SERVER2_AUTH_ENDPOINT, SERVER2_DEVICE_ENDPOINT
+    SERVER2_USERNAME, SERVER2_PASSWORD
+    SERVER1_WEBHOOK_URL
+    NETBOX_URL, NETBOX_TOKEN
+    NETBOX_DEVICE_ENCRYPTION_KEY
 """
 
 from flask import Flask, request, jsonify
@@ -26,7 +24,7 @@ from flask_cors import CORS
 import requests
 import os
 import logging
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from cryptography.fernet import Fernet
 
 # Configure logging
@@ -39,6 +37,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+# Thread pool for concurrent Server2 validations (bulk webhook processing)
+# 15 workers = up to 15 parallel SSH validations via Server2
+MAX_WORKERS = int(os.environ.get('WEBHOOK_MAX_WORKERS', '15'))
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
 # Server2 Configuration (SSH Validation)
 SERVER2_BASE_URL = os.environ.get('SERVER2_BASE_URL', 'http://10.4.160.240:8081')
 SERVER2_AUTH_ENDPOINT = os.environ.get('SERVER2_AUTH_ENDPOINT', '/api/auth/signin')
@@ -48,6 +51,10 @@ SERVER2_PASSWORD = os.environ.get('SERVER2_PASSWORD', 'admin')
 
 # Server1 Configuration (Telemetry)
 SERVER1_WEBHOOK_URL = os.environ.get('SERVER1_WEBHOOK_URL', 'http://172.27.1.70:5000/endpoint')
+
+# NetBox Configuration (to update custom fields after validation)
+NETBOX_URL = os.environ.get('NETBOX_URL', 'http://netbox:8080')
+NETBOX_TOKEN = os.environ.get('NETBOX_TOKEN', '0123456789abcdef0123456789abcdef01234567')
 
 # Encryption key for device passwords
 ENCRYPTION_KEY = os.environ.get('NETBOX_DEVICE_ENCRYPTION_KEY', 'XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA=')
@@ -66,6 +73,30 @@ def decrypt_password(encrypted_password):
     except Exception as e:
         logger.error(f"Failed to decrypt password: {e}")
         return None
+
+
+def update_netbox_device(device_id, custom_fields):
+    """Update device custom fields in NetBox"""
+    try:
+        url = f"{NETBOX_URL}/api/dcim/devices/{device_id}/"
+        headers = {
+            'Authorization': f'Token {NETBOX_TOKEN}',
+            'Content-Type': 'application/json'
+        }
+        payload = {'custom_fields': custom_fields}
+
+        logger.info(f"Updating NetBox device {device_id}: {custom_fields}")
+        response = requests.patch(url, json=payload, headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            logger.info(f"NetBox device {device_id} updated successfully")
+            return True
+        else:
+            logger.warning(f"NetBox update failed: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"NetBox update error: {e}")
+        return False
 
 
 class Server2Client:
@@ -103,15 +134,19 @@ class Server2Client:
         """
         Validate device SSH connectivity via Server2
 
-        Returns: dict with success status and details
+        Returns dict with:
+          - success: bool (HTTP 200 from Server2)
+          - reachable: bool (device was reachable, not timed out)
+          - authenticated: bool (SSH credentials worked)
+          - message: str
         """
         try:
-            # Authenticate first
             if not self.token:
                 if not self.authenticate():
                     return {
                         'success': False,
-                        'status_code': 401,
+                        'reachable': None,
+                        'authenticated': None,
                         'message': 'Failed to authenticate with Server2'
                     }
 
@@ -132,54 +167,56 @@ class Server2Client:
 
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"Server2 validation success: {data.get('message')}")
-                return {
-                    'success': True,
-                    'status_code': 200,
-                    'message': data.get('message', 'Device validated successfully'),
-                    'data': data
-                }
+                message = data.get('message', '')
+                logger.info(f"Server2 response for {ip_address}: {message}")
+
+                # Parse Server2 response to determine reachable/authenticated
+                msg_lower = message.lower()
+
+                if 'unreachable' in msg_lower or 'time out' in msg_lower or 'timeout' in msg_lower:
+                    # Device not reachable (SSH connection timed out)
+                    return {
+                        'success': True,
+                        'reachable': False,
+                        'authenticated': None,
+                        'message': message
+                    }
+                elif 'auth' in msg_lower and 'fail' in msg_lower:
+                    # Device reachable but SSH auth failed (bad credentials)
+                    return {
+                        'success': True,
+                        'reachable': True,
+                        'authenticated': False,
+                        'message': message
+                    }
+                else:
+                    # Device reachable and SSH succeeded
+                    return {
+                        'success': True,
+                        'reachable': True,
+                        'authenticated': True,
+                        'message': message
+                    }
             else:
                 logger.warning(f"Server2 validation failed: {response.status_code} - {response.text}")
                 return {
                     'success': False,
-                    'status_code': response.status_code,
+                    'reachable': None,
+                    'authenticated': None,
                     'message': response.text
                 }
         except Exception as e:
             logger.error(f"Server2 validation error: {e}")
             return {
                 'success': False,
-                'status_code': 500,
+                'reachable': None,
+                'authenticated': None,
                 'message': str(e)
             }
 
 
-def send_to_telemetry(webhook_payload):
-    """Forward webhook payload to Server1 (Telemetry)"""
-    try:
-        logger.info(f"Sending webhook to Server1 (Telemetry): {SERVER1_WEBHOOK_URL}")
-
-        response = requests.post(
-            SERVER1_WEBHOOK_URL,
-            json=webhook_payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=30
-        )
-
-        if response.status_code in [200, 201, 202]:
-            logger.info(f"Telemetry webhook sent successfully: {response.status_code}")
-            return True, response.status_code, response.text
-        else:
-            logger.warning(f"Telemetry webhook failed: {response.status_code} - {response.text}")
-            return False, response.status_code, response.text
-    except Exception as e:
-        logger.error(f"Telemetry webhook error: {e}")
-        return False, 500, str(e)
-
-
 def extract_device_info(webhook_data):
-    """Extract device information from webhook payload"""
+    """Extract all device information from webhook payload"""
     data = webhook_data.get('data', {})
 
     # Get IP address
@@ -195,14 +232,16 @@ def extract_device_info(webhook_data):
     # If no primary IP, try to use device name (which might be IP)
     if not ip_address:
         name = data.get('name', '')
-        # Check if name looks like an IP
         if name and (name.count('.') == 3 or ':' in name):
             ip_address = name
 
-    # Get custom fields (username/password)
-    custom_fields = data.get('custom_fields', {})
+    # Get custom fields
+    custom_fields = data.get('custom_fields', {}) or {}
     username = custom_fields.get('username')
     password = custom_fields.get('password')
+    reachable = custom_fields.get('reachable')
+    authentication = custom_fields.get('authentication')
+    management = custom_fields.get('management')
 
     # Clean up None strings
     if username == 'None' or not username:
@@ -216,165 +255,218 @@ def extract_device_info(webhook_data):
         if decrypted:
             password = decrypted
 
+    # Get device type / manufacturer / role / site
+    device_type = data.get('device_type', {}) or {}
+    manufacturer = device_type.get('manufacturer', {}) or {}
+    role = data.get('role', {}) or {}
+    site = data.get('site', {}) or {}
+    status = data.get('status', {})
+
     return {
         'id': data.get('id'),
-        'name': data.get('name'),
+        'name': data.get('name', ''),
         'ip_address': ip_address,
         'username': username,
         'password': password,
-        'status': data.get('status', {}).get('value') if isinstance(data.get('status'), dict) else data.get('status')
+        'reachable': reachable,
+        'authentication': authentication,
+        'management': management,
+        'status': status.get('value') if isinstance(status, dict) else status,
+        'model': device_type.get('model', ''),
+        'manufacturer': manufacturer.get('name', ''),
+        'role': role.get('name', ''),
+        'site': site.get('name', ''),
     }
+
+
+def build_telemetry_payload(device_info, event, timestamp):
+    """Build a clean payload for the telemetry service"""
+    return {
+        'event': event,
+        'timestamp': timestamp,
+        'device_id': device_info['id'],
+        'device_name': device_info['name'],
+        'device_ip': device_info['ip_address'],
+        'username': device_info['username'] or '',
+        'password': device_info['password'] or '',
+        'reachable': device_info['reachable'],
+        'authentication': device_info['authentication'],
+        'management': device_info['management'],
+        'status': device_info['status'] or '',
+        'model': device_info['model'],
+        'manufacturer': device_info['manufacturer'],
+        'role': device_info['role'],
+        'site': device_info['site'],
+    }
+
+
+def send_to_telemetry(telemetry_payload):
+    """Send clean payload to Server1 (Telemetry)"""
+    try:
+        logger.info(f"Sending to telemetry: {SERVER1_WEBHOOK_URL}")
+        logger.info(f"Telemetry payload: {telemetry_payload}")
+
+        response = requests.post(
+            SERVER1_WEBHOOK_URL,
+            json=telemetry_payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=30
+        )
+
+        if response.status_code in [200, 201, 202]:
+            logger.info(f"Telemetry sent successfully: {response.status_code}")
+            return True, response.status_code, response.text
+        else:
+            logger.warning(f"Telemetry failed: {response.status_code} - {response.text}")
+            return False, response.status_code, response.text
+    except Exception as e:
+        logger.error(f"Telemetry error: {e}")
+        return False, 500, str(e)
+
+
+def process_device_validation(device_info, event, timestamp):
+    """
+    Background task: Server2 validation → Update NetBox → Send to Telemetry
+
+    Runs in thread pool so the webhook endpoint can return immediately.
+    With 30 workers, up to 30 devices are validated concurrently (~5s each).
+    """
+    device_id = device_info['id']
+    ip_address = device_info['ip_address']
+
+    try:
+        # === Step 1: Server2 SSH validation (if credentials available) ===
+        if device_info['username'] and device_info['password']:
+            logger.info(f"[BG] Validating SSH via Server2 for {ip_address}")
+
+            server2_client = Server2Client()
+            server2_result = server2_client.validate_device(
+                ip_address=ip_address,
+                username=device_info['username'],
+                password=device_info['password']
+            )
+
+            logger.info(f"[BG] Server2 result for {ip_address}: "
+                         f"reachable={server2_result['reachable']}, "
+                         f"authenticated={server2_result['authenticated']}, "
+                         f"message={server2_result['message']}")
+
+            # Update NetBox custom fields based on Server2 result
+            netbox_update = {}
+            if server2_result['reachable'] is not None:
+                netbox_update['reachable'] = server2_result['reachable']
+                device_info['reachable'] = server2_result['reachable']
+            if server2_result['authenticated'] is not None:
+                netbox_update['authentication'] = server2_result['authenticated']
+                device_info['authentication'] = server2_result['authenticated']
+
+            if netbox_update and device_id:
+                update_netbox_device(device_id, netbox_update)
+
+            # If Server2 API itself failed, don't send to telemetry
+            if not server2_result['success']:
+                logger.warning(f"[BG] Server2 API error for {ip_address} - NOT sending to telemetry")
+                return
+        else:
+            logger.info(f"[BG] No credentials for {ip_address} - skipping Server2 validation")
+
+        # === Step 2: Send to Telemetry (always, so frontend has latest state) ===
+        telemetry_payload = build_telemetry_payload(device_info, event, timestamp)
+        logger.info(f"[BG] Sending {event} event to telemetry for {ip_address}")
+        success, status_code, response = send_to_telemetry(telemetry_payload)
+
+        if success:
+            logger.info(f"[BG] Telemetry sent for {ip_address}: {status_code}")
+        else:
+            logger.warning(f"[BG] Telemetry failed for {ip_address}: {status_code} - {response}")
+
+    except Exception as e:
+        logger.error(f"[BG] Processing error for device {device_id} ({ip_address}): {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     """
-    Main webhook endpoint that receives NetBox webhooks
+    Main webhook endpoint - accepts webhook and returns immediately.
 
-    Flow:
-    - Device Created: Server2 (SSH) -> If success -> Server1 (Telemetry)
-    - Device Updated: Server1 (Telemetry) directly
+    Heavy processing (Server2 SSH validation ~5s per device) runs in background
+    thread pool. This allows the NetBox RQ worker to quickly dispatch all webhooks
+    during bulk operations (1000+ devices), with up to MAX_WORKERS concurrent
+    Server2 validations happening in parallel.
     """
     try:
         webhook_data = request.get_json()
 
         event = webhook_data.get('event')
-        model = webhook_data.get('model') or webhook_data.get('object_type', 'dcim.device')
         timestamp = webhook_data.get('timestamp')
 
-        logger.info(f"Received webhook: event={event}, model={model}, timestamp={timestamp}")
-        logger.info(f"Webhook payload keys: {list(webhook_data.keys())}")
-        logger.info(f"Webhook data keys: {list(webhook_data.get('data', {}).keys())}")
+        logger.info(f"Received webhook: event={event}, timestamp={timestamp}")
 
-        # Extract device info
+        # Extract device info (lightweight - just parsing JSON)
         device_info = extract_device_info(webhook_data)
-        logger.info(f"Device info: id={device_info['id']}, name={device_info['name']}, ip={device_info['ip_address']}")
+        logger.info(f"Device: id={device_info['id']}, name={device_info['name']}, "
+                     f"ip={device_info['ip_address']}, model={device_info['model']}")
 
-        result = {
-            'event': event,
+        # No IP = device data is incomplete, skip immediately
+        if not device_info['ip_address']:
+            logger.info(f"No IP address yet for device {device_info['name']} - skipping")
+            return jsonify({
+                'status': 'skipped',
+                'reason': 'No IP address - device data incomplete',
+                'device_id': device_info['id'],
+                'device_name': device_info['name']
+            }), 200
+
+        # Submit to thread pool for background processing
+        executor.submit(process_device_validation, device_info, event, timestamp)
+
+        logger.info(f"Queued device {device_info['name']} ({device_info['ip_address']}) for background processing")
+
+        return jsonify({
+            'status': 'accepted',
             'device_id': device_info['id'],
             'device_name': device_info['name'],
             'ip_address': device_info['ip_address'],
-            'timestamp': timestamp
-        }
-
-        # ==================== DEVICE CREATED ====================
-        if event == 'created':
-            logger.info("Processing CREATED event - validating SSH first")
-
-            # Check if we have IP and credentials
-            if not device_info['ip_address']:
-                logger.warning("No IP address for SSH validation")
-                result['server2_status'] = 'skipped'
-                result['server2_reason'] = 'No IP address'
-            elif not device_info['username'] or not device_info['password']:
-                logger.warning("No credentials for SSH validation")
-                result['server2_status'] = 'skipped'
-                result['server2_reason'] = 'No credentials'
-            else:
-                # Call Server2 for SSH validation
-                server2_client = Server2Client()
-                server2_result = server2_client.validate_device(
-                    ip_address=device_info['ip_address'],
-                    username=device_info['username'],
-                    password=device_info['password']
-                )
-
-                result['server2_status'] = 'success' if server2_result['success'] else 'failed'
-                result['server2_message'] = server2_result['message']
-                result['server2_status_code'] = server2_result['status_code']
-
-                # Only proceed to telemetry if SSH validation succeeded
-                if not server2_result['success']:
-                    logger.warning(f"Server2 SSH validation failed - NOT sending to telemetry")
-                    result['server1_status'] = 'skipped'
-                    result['server1_reason'] = 'Server2 SSH validation failed'
-                    return jsonify(result), 200
-
-            # Send to Server1 (Telemetry) - only if Server2 succeeded or was skipped
-            logger.info("Sending CREATED event to Server1 (Telemetry)")
-            success, status_code, response = send_to_telemetry(webhook_data)
-            result['server1_status'] = 'success' if success else 'failed'
-            result['server1_status_code'] = status_code
-            if not success:
-                result['server1_error'] = response
-
-            return jsonify(result), 200
-
-        # ==================== DEVICE UPDATED ====================
-        elif event == 'updated':
-            logger.info("Processing UPDATED event - sending directly to telemetry")
-
-            # Send directly to Server1 (Telemetry)
-            success, status_code, response = send_to_telemetry(webhook_data)
-            result['server1_status'] = 'success' if success else 'failed'
-            result['server1_status_code'] = status_code
-            if not success:
-                result['server1_error'] = response
-
-            return jsonify(result), 200
-
-        # ==================== DEVICE DELETED ====================
-        elif event == 'deleted':
-            logger.info("Processing DELETED event - sending to telemetry")
-
-            # Send to Server1 (Telemetry)
-            success, status_code, response = send_to_telemetry(webhook_data)
-            result['server1_status'] = 'success' if success else 'failed'
-            result['server1_status_code'] = status_code
-            if not success:
-                result['server1_error'] = response
-
-            return jsonify(result), 200
-
-        else:
-            logger.info(f"Unknown event type: {event}")
-            return jsonify({
-                'status': 'ignored',
-                'event': event,
-                'reason': 'Unknown event type'
-            }), 200
+            'event': event,
+            'message': 'Queued for Server2 validation and telemetry'
+        }), 202
 
     except Exception as e:
         logger.error(f"Webhook handler error: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            'status': 'error',
-            'error': str(e)
-        }), 500
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'service': 'webhook-handler',
         'server2_url': SERVER2_BASE_URL,
-        'server1_url': SERVER1_WEBHOOK_URL
+        'server1_url': SERVER1_WEBHOOK_URL,
+        'netbox_url': NETBOX_URL
     })
 
 
 @app.route('/', methods=['GET'])
 def index():
-    """API documentation"""
     return jsonify({
         'service': 'NetBox Webhook Handler',
-        'version': '1.0',
-        'description': 'Orchestrates webhook flow between NetBox, Server2 (SSH), and Server1 (Telemetry)',
+        'version': '3.1',
+        'mode': f'Async (ThreadPool: {MAX_WORKERS} workers)',
         'flow': {
-            'created': 'NetBox -> Server2 (SSH validation) -> If success -> Server1 (Telemetry)',
-            'updated': 'NetBox -> Server1 (Telemetry) directly',
-            'deleted': 'NetBox -> Server1 (Telemetry) directly'
+            '1_no_ip': 'Skip (device data incomplete)',
+            '2_has_creds': 'Server2 (SSH) → Update NetBox reachable/authentication → Telemetry',
+            '3_no_creds': 'Telemetry directly'
         },
-        'endpoints': {
-            'POST /webhook': 'Receive NetBox webhooks',
-            'GET /health': 'Health check'
-        },
-        'config': {
-            'server2_url': SERVER2_BASE_URL,
-            'server1_url': SERVER1_WEBHOOK_URL
+        'states': {
+            'reachable=true, auth=true': 'Online, SSH valid',
+            'reachable=true, auth=false': 'Online, bad credentials (user can retry)',
+            'reachable=false': 'Device offline/unreachable',
+            'null': 'Pending validation'
         }
     })
 
@@ -382,21 +474,28 @@ def index():
 if __name__ == '__main__':
     logger.info(f"""
 ================================================================================
-NetBox Webhook Handler Service
+NetBox Webhook Handler Service v3.1 (Async)
 ================================================================================
-Server2 (SSH Validation):
-  URL: {SERVER2_BASE_URL}
-  Auth Endpoint: {SERVER2_AUTH_ENDPOINT}
-  Device Endpoint: {SERVER2_DEVICE_ENDPOINT}
-  Username: {SERVER2_USERNAME}
+Server2 (SSH Validation): {SERVER2_BASE_URL}
+Server1 (Telemetry):      {SERVER1_WEBHOOK_URL}
+NetBox:                    {NETBOX_URL}
+Thread Pool Workers:       {MAX_WORKERS}
 
-Server1 (Telemetry):
-  URL: {SERVER1_WEBHOOK_URL}
+Flow (same for all events - processed in background):
+  Has IP + creds → Server2 → Update reachable/authentication in NetBox → Telemetry
+  Has IP, no creds → Telemetry directly
+  No IP → Skip (returned immediately)
 
-Flow:
-  CREATED: NetBox -> Server2 (SSH) -> If success -> Server1 (Telemetry)
-  UPDATED: NetBox -> Server1 (Telemetry) directly
-  DELETED: NetBox -> Server1 (Telemetry) directly
+Bulk Mode:
+  Webhook returns 202 Accepted immediately
+  Up to {MAX_WORKERS} devices validated concurrently via Server2
+  1000 devices @ 5s each = ~{1000 // MAX_WORKERS * 5 // 60} min (vs ~83 min sequential)
+
+Device States:
+  reachable=true,  authentication=true  → Online, SSH valid
+  reachable=true,  authentication=false → Online, bad creds (user can update & retry)
+  reachable=false, authentication=null  → Offline/unreachable
+  null, null                            → Pending validation
 ================================================================================
 """)
     app.run(host='0.0.0.0', port=5002, debug=True)

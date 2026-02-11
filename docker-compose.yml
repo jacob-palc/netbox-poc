@@ -126,8 +126,13 @@ services:
       SERVER2_PASSWORD: "admin"
       # Server1 (Telemetry)
       SERVER1_WEBHOOK_URL: "http://172.27.1.70:5000/endpoint"
+      # NetBox (to update reachable/authentication fields after validation)
+      NETBOX_URL: "http://netbox:8080"
+      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
       # Encryption key (to decrypt device passwords before sending to Server2)
       NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
+      # Concurrent processing (15 workers = 15 parallel SSH validations)
+      WEBHOOK_MAX_WORKERS: "15"
     restart: unless-stopped
 
   # Device Onboarding API (single-call device creation with IP)

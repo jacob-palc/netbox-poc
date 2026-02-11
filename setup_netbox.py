@@ -326,27 +326,28 @@ class NetBoxSetup:
             'http_method': 'POST',
             'http_content_type': 'application/json',
             'ssl_verification': False,
-            'body_template': '''{
-  "event": "{{ event }}",
-  "model": "dcim.device",
-  "timestamp": "{{ timestamp }}",
-  "data": {
-    "id": {{ data.id }},
-    "name": "{{ data.name | default('') }}",
-    "primary_ip4": {% if data.primary_ip4 %}{"address": "{{ data.primary_ip4.address }}"}{% else %}null{% endif %},
-    "custom_fields": {
-      "username": {% if data.custom_fields.username %}"{{ data.custom_fields.username }}"{% else %}null{% endif %},
-      "password": {% if data.custom_fields.password %}"{{ data.custom_fields.password }}"{% else %}null{% endif %},
-      "reachable": {% if data.custom_fields.reachable is not none %}{{ data.custom_fields.reachable | lower }}{% else %}null{% endif %},
-      "authentication": {% if data.custom_fields.authentication is not none %}{{ data.custom_fields.authentication | lower }}{% else %}null{% endif %},
-      "management": {% if data.custom_fields.management is not none %}{{ data.custom_fields.management | lower }}{% else %}null{% endif %}
-    },
-    "status": {"value": "{{ data.status.value }}"},
-    "device_type": {"model": "{{ data.device_type.model }}", "manufacturer": {"name": "{{ data.device_type.manufacturer.name }}"}},
-    "role": {"name": "{{ data.role.name }}"},
-    "site": {"name": "{{ data.site.name }}"}
-  }
-}'''
+            'body_template': (
+                '{'
+                '"event":"{{ event }}",'
+                '"timestamp":"{{ timestamp }}",'
+                '"data":{'
+                '"id":{{ data.id }},'
+                '"name":"{{ data.name | default(\'\') }}",'
+                '"primary_ip4":{% if data.primary_ip4 %}{"address":"{{ data.primary_ip4.address }}"}{% else %}null{% endif %},'
+                '"custom_fields":{'
+                '"username":{% if data.custom_fields.username %}"{{ data.custom_fields.username }}"{% else %}null{% endif %},'
+                '"password":{% if data.custom_fields.password %}"{{ data.custom_fields.password }}"{% else %}null{% endif %},'
+                '"reachable":{% if data.custom_fields.reachable is not none %}{{ data.custom_fields.reachable | lower }}{% else %}null{% endif %},'
+                '"authentication":{% if data.custom_fields.authentication is not none %}{{ data.custom_fields.authentication | lower }}{% else %}null{% endif %},'
+                '"management":{% if data.custom_fields.management is not none %}{{ data.custom_fields.management | lower }}{% else %}null{% endif %}'
+                '},'
+                '"status":{"value":"{{ data.status.value }}"},'
+                '"device_type":{"model":"{{ data.device_type.model }}","manufacturer":{"name":"{{ data.device_type.manufacturer.name }}"}},'
+                '"role":{"name":"{{ data.role.name }}"},'
+                '"site":{"name":"{{ data.site.name }}"}'
+                '}'
+                '}'
+            )
         }
 
         # Check if webhook exists
