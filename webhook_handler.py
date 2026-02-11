@@ -239,18 +239,12 @@ def handle_webhook():
         webhook_data = request.get_json()
 
         event = webhook_data.get('event')
-        model = webhook_data.get('model') or webhook_data.get('object_type')
+        model = webhook_data.get('model') or webhook_data.get('object_type', 'dcim.device')
         timestamp = webhook_data.get('timestamp')
 
         logger.info(f"Received webhook: event={event}, model={model}, timestamp={timestamp}")
-
-        # Only process device events
-        if model != 'dcim.device':
-            logger.info(f"Ignoring non-device webhook: {model}")
-            return jsonify({
-                'status': 'ignored',
-                'reason': f'Model {model} not handled'
-            }), 200
+        logger.info(f"Webhook payload keys: {list(webhook_data.keys())}")
+        logger.info(f"Webhook data keys: {list(webhook_data.get('data', {}).keys())}")
 
         # Extract device info
         device_info = extract_device_info(webhook_data)

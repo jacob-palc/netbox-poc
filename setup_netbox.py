@@ -328,7 +328,7 @@ class NetBoxSetup:
             'ssl_verification': False,
             'body_template': '''{
   "event": "{{ event }}",
-  "model": "{{ object_type }}",
+  "model": "dcim.device",
   "timestamp": "{{ timestamp }}",
   "data": {
     "id": {{ data.id }},
@@ -382,9 +382,53 @@ class NetBoxSetup:
             print(f"  WARNING: Failed to create webhook: {response.text}")
             return None
 
+    def cleanup_stale_webhooks(self, keep_webhook_id):
+        """Remove any old/stale webhooks that might be pointing to telemetry directly"""
+        print("\n--- Cleaning Up Stale Webhooks ---")
+
+        response = requests.get(
+            f"{self.api_url}/extras/webhooks/",
+            headers=self.headers
+        )
+        if response.status_code != 200:
+            print(f"  WARNING: Could not list webhooks: {response.text}")
+            return
+
+        webhooks = response.json().get('results', [])
+        for wh in webhooks:
+            if wh['id'] != keep_webhook_id:
+                print(f"  Removing stale webhook: '{wh['name']}' (ID: {wh['id']}, URL: {wh['payload_url']})")
+                requests.delete(
+                    f"{self.api_url}/extras/webhooks/{wh['id']}/",
+                    headers=self.headers
+                )
+
+        print(f"  Keeping webhook ID {keep_webhook_id} -> {self.webhook_handler_url}")
+
+    def cleanup_stale_event_rules(self, keep_rule_names):
+        """Remove any old/stale event rules not in our expected set"""
+        print("\n--- Cleaning Up Stale Event Rules ---")
+
+        response = requests.get(
+            f"{self.api_url}/extras/event-rules/",
+            headers=self.headers
+        )
+        if response.status_code != 200:
+            print(f"  WARNING: Could not list event rules: {response.text}")
+            return
+
+        rules = response.json().get('results', [])
+        for rule in rules:
+            if rule['name'] not in keep_rule_names:
+                print(f"  Removing stale event rule: '{rule['name']}' (ID: {rule['id']})")
+                requests.delete(
+                    f"{self.api_url}/extras/event-rules/{rule['id']}/",
+                    headers=self.headers
+                )
+
     def create_event_rule(self, webhook_id):
-        """Create event rules to trigger webhook"""
-        print("\n--- Creating Event Rules ---")
+        """Create or update event rules to trigger webhook"""
+        print("\n--- Creating/Updating Event Rules ---")
 
         if not webhook_id:
             print("  WARNING: Skipping event rules - no webhook ID")
@@ -424,7 +468,18 @@ class NetBoxSetup:
             )
             if response.json()['count'] > 0:
                 rule_id = response.json()['results'][0]['id']
-                print(f"  Event rule '{rule_data['name']}' already exists (ID: {rule_id})")
+                existing = response.json()['results'][0]
+                # Always update to ensure it points to the correct webhook
+                print(f"  Event rule '{rule_data['name']}' exists (ID: {rule_id}), updating to webhook {webhook_id}...")
+                response = requests.patch(
+                    f"{self.api_url}/extras/event-rules/{rule_id}/",
+                    headers=self.headers,
+                    json=rule_data
+                )
+                if response.status_code == 200:
+                    print(f"  Updated event rule: {rule_data['name']} -> webhook {webhook_id}")
+                else:
+                    print(f"  WARNING: Failed to update event rule: {response.text}")
                 created_ids.append(rule_id)
                 continue
 
@@ -458,7 +513,18 @@ class NetBoxSetup:
         self.create_device_roles()
         self.create_site()
         webhook_id = self.create_webhook()
+
+        # Clean up any stale webhooks/rules from previous configurations
+        # (e.g., old webhooks pointing directly to telemetry instead of webhook-handler)
+        if webhook_id:
+            self.cleanup_stale_webhooks(keep_webhook_id=webhook_id)
+
         self.create_event_rule(webhook_id)
+
+        # Clean up any stale event rules not managed by us
+        self.cleanup_stale_event_rules(
+            keep_rule_names=['Device Onboarding Event', 'Device Update Event']
+        )
 
         print("\n" + "="*70)
         print("Setup Complete!")
