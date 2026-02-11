@@ -24,11 +24,11 @@ import sys
 # Default configuration
 DEFAULT_NETBOX_URL = "http://localhost:8000"
 DEFAULT_API_TOKEN = "0123456789abcdef0123456789abcdef01234567"
-DEFAULT_TELEMETRY_URL = "http://172.27.1.70:5000/endpoint"
+DEFAULT_WEBHOOK_HANDLER_URL = "http://webhook-handler:5002/webhook"
 
 
 class NetBoxSetup:
-    def __init__(self, netbox_url, api_token, telemetry_url):
+    def __init__(self, netbox_url, api_token, webhook_handler_url):
         self.base_url = netbox_url.rstrip('/')
         self.api_url = f"{self.base_url}/api"
         self.headers = {
@@ -36,7 +36,7 @@ class NetBoxSetup:
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
-        self.telemetry_url = telemetry_url
+        self.webhook_handler_url = webhook_handler_url
 
     def wait_for_netbox(self, max_retries=30, delay=10):
         """Wait for NetBox to be ready"""
@@ -322,11 +322,11 @@ class NetBoxSetup:
 
         webhook_data = {
             'name': 'Device Onboarding Webhook',
-            'payload_url': self.telemetry_url,
+            'payload_url': self.webhook_handler_url,
             'http_method': 'POST',
             'http_content_type': 'application/json',
-            'ssl_verification': False,  # For testing with mock service
-            'body_template': ''
+            'ssl_verification': False,
+            'body_template': '{"event": "{{ event }}", "model": "{{ object_type }}", "timestamp": "{{ timestamp }}", "username": "{{ username }}", "data": {{ data | tojson }}}'
         }
 
         # Check if webhook exists
@@ -446,13 +446,13 @@ class NetBoxSetup:
         print(f"\nNetBox URL: {self.base_url}")
         print(f"Admin credentials: admin / admin123")
         print(f"API Token: {self.headers['Authorization'].split()[1]}")
-        print(f"\nTelemetry webhook URL: {self.telemetry_url}")
+        print(f"\nWebhook handler URL: {self.webhook_handler_url}")
+        print(f"Flow: NetBox -> Webhook Handler -> Server2 (SSH) -> Telemetry")
         print("\nYou can now:")
         print("  1. Login to NetBox at http://localhost:8000")
-        print("  2. Go to Customization > Scripts")
-        print("  3. Run 'Simple Device Onboarding' script")
-        print("  4. Check webhook delivery in Operations > Webhooks")
-        print("  5. View received webhooks at http://localhost:5000/api/v1/webhooks")
+        print("  2. Onboard a device via API (port 5001)")
+        print("  3. Check webhook-handler logs: docker compose logs -f webhook-handler")
+        print("  4. Check worker logs: docker compose logs -f netbox-worker")
         print("="*70)
 
         return True
@@ -462,11 +462,11 @@ def main():
     parser = argparse.ArgumentParser(description='Setup NetBox for device onboarding')
     parser.add_argument('--netbox-url', default=DEFAULT_NETBOX_URL, help='NetBox URL')
     parser.add_argument('--token', default=DEFAULT_API_TOKEN, help='NetBox API token')
-    parser.add_argument('--telemetry-url', default=DEFAULT_TELEMETRY_URL, help='Telemetry service webhook URL')
+    parser.add_argument('--webhook-handler-url', default=DEFAULT_WEBHOOK_HANDLER_URL, help='Webhook handler URL')
 
     args = parser.parse_args()
 
-    setup = NetBoxSetup(args.netbox_url, args.token, args.telemetry_url)
+    setup = NetBoxSetup(args.netbox_url, args.token, args.webhook_handler_url)
     success = setup.run_setup()
 
     sys.exit(0 if success else 1)

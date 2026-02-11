@@ -40,7 +40,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Server2 Configuration (SSH Validation)
-SERVER2_BASE_URL = os.environ.get('SERVER2_BASE_URL', 'http://10.4.160.240:5000')
+SERVER2_BASE_URL = os.environ.get('SERVER2_BASE_URL', 'http://10.4.160.240:8081')
 SERVER2_AUTH_ENDPOINT = os.environ.get('SERVER2_AUTH_ENDPOINT', '/api/auth/signin')
 SERVER2_DEVICE_ENDPOINT = os.environ.get('SERVER2_DEVICE_ENDPOINT', '/device')
 SERVER2_USERNAME = os.environ.get('SERVER2_USERNAME', 'admin')
@@ -239,7 +239,7 @@ def handle_webhook():
         webhook_data = request.get_json()
 
         event = webhook_data.get('event')
-        model = webhook_data.get('model')
+        model = webhook_data.get('model') or webhook_data.get('object_type')
         timestamp = webhook_data.get('timestamp')
 
         logger.info(f"Received webhook: event={event}, model={model}, timestamp={timestamp}")

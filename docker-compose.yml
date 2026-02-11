@@ -106,6 +106,30 @@ services:
       SSH_VALIDATION_TIMEOUT: "30"
       SSH_VALIDATION_COMMAND: "show version"
 
+  # Webhook Handler (orchestrates NetBox -> Server2 SSH validation -> Telemetry)
+  webhook-handler:
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook-handler
+    container_name: webhook-handler
+    depends_on:
+      netbox:
+        condition: service_healthy
+    ports:
+      - "5002:5002"
+    environment:
+      # Server2 (SSH Validation)
+      SERVER2_BASE_URL: "http://10.4.160.240:8081"
+      SERVER2_AUTH_ENDPOINT: "/api/auth/signin"
+      SERVER2_DEVICE_ENDPOINT: "/device"
+      SERVER2_USERNAME: "admin"
+      SERVER2_PASSWORD: "admin"
+      # Server1 (Telemetry)
+      SERVER1_WEBHOOK_URL: "http://172.27.1.70:5000/endpoint"
+      # Encryption key (to decrypt device passwords before sending to Server2)
+      NETBOX_DEVICE_ENCRYPTION_KEY: "XPmjtY0wwxQbD0ezEMDhGlAo2_JGXb6yB4yp5I-MnGA="
+    restart: unless-stopped
+
   # Device Onboarding API (single-call device creation with IP)
   onboarding-api:
     build:
