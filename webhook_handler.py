@@ -459,6 +459,24 @@ def handle_webhook():
                 'device_id': device_id
             }), 200
 
+        # Skip "updated" events for already-validated devices.
+        # The device-monitor pings every 60s and updates NetBox, firing "updated" webhooks.
+        # If reachable & authentication are already set, no need to re-validate via Server2.
+        # To force re-validation, clear reachable/authentication fields in NetBox first.
+        if event == 'updated':
+            reachable = device_info.get('reachable')
+            authentication = device_info.get('authentication')
+            if reachable is not None and authentication is not None:
+                logger.info(f"Skipping device {device_id} - already validated "
+                            f"(reachable={reachable}, auth={authentication})")
+                return jsonify({
+                    'status': 'skipped',
+                    'reason': 'already validated',
+                    'device_id': device_id,
+                    'reachable': reachable,
+                    'authentication': authentication
+                }), 200
+
         # Mark as processing now (before queuing to thread pool)
         _recently_processed[device_id] = now
 
