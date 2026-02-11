@@ -313,6 +313,12 @@ def build_telemetry_payload(device_info, event, timestamp):
     raw_data['custom_fields']['authentication'] = device_info['authentication']
     raw_data['custom_fields']['management'] = device_info['management']
 
+    # Ensure primary_ip4 is set (webhook may fire before IP is assigned,
+    # but we may have extracted it from device name)
+    ip = device_info.get('ip_address')
+    if ip and not raw_data.get('primary_ip4'):
+        raw_data['primary_ip4'] = {'address': f"{ip}/32"}
+
     return {
         'event': event,
         'timestamp': timestamp,
