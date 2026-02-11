@@ -287,24 +287,33 @@ def extract_device_info(webhook_data):
 
 
 def build_telemetry_payload(device_info, event, timestamp):
-    """Build payload for the telemetry service (Go struct expects nested objects)"""
+    """
+    Build payload matching the original NetBox webhook structure.
+    The Go telemetry service reads: data.role.name, data.site.name, etc.
+    """
+    ip = device_info['ip_address'] or ''
     return {
         'event': event,
         'timestamp': timestamp,
-        'device_id': device_info['id'],
-        'device_name': device_info['name'],
-        'device_ip': device_info['ip_address'],
-        'username': device_info['username'] or '',
-        'password': device_info['password'] or '',
-        'reachable': device_info['reachable'],
-        'authentication': device_info['authentication'],
-        'management': device_info['management'],
-        'status': {'value': device_info['status'] or ''},
-        'model': device_info['model'],
-        'manufacturer': {'name': device_info['manufacturer']},
-        'device_type': {'model': device_info['model'], 'manufacturer': {'name': device_info['manufacturer']}},
-        'role': {'name': device_info['role'].lower() if device_info['role'] else ''},
-        'site': {'name': device_info['site']},
+        'data': {
+            'id': device_info['id'],
+            'name': device_info['name'],
+            'primary_ip4': {'address': f"{ip}/32"} if ip else None,
+            'device_type': {
+                'model': device_info['model'],
+                'manufacturer': {'name': device_info['manufacturer']}
+            },
+            'role': {'name': device_info['role'].lower() if device_info['role'] else ''},
+            'site': {'name': device_info['site']},
+            'status': {'value': device_info['status'] or ''},
+            'custom_fields': {
+                'username': device_info['username'] or None,
+                'password': device_info['password'] or None,
+                'reachable': device_info['reachable'],
+                'authentication': device_info['authentication'],
+                'management': device_info['management'],
+            }
+        }
     }
 
 
