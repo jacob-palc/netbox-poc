@@ -375,7 +375,12 @@ def _onboard_manual(data):
                 'interface_error': interface_error,
                 'ip_create_error': ip_create_error,
                 'assign_error': assign_error,
-                'onboard_type': 'manual'
+                'onboard_type': 'manual',
+                # Validation status (updated async by webhook-handler after SSH validation)
+                'reachable': None,
+                'authentication': None,
+                'management': None,
+                'validation_status': 'pending'
             }
         }, 201
 
