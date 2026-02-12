@@ -23,10 +23,15 @@ import os
 import io
 import csv
 import time
+import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from cryptography.fernet import Fernet
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
@@ -50,9 +55,14 @@ session.mount('https://', adapter)
 
 # Bulk onboard configuration
 BULK_MAX_WORKERS = int(os.environ.get('BULK_MAX_WORKERS', '15'))
-BULK_MAX_DEVICES = int(os.environ.get('BULK_MAX_DEVICES', '1000'))
+BULK_MAX_DEVICES = int(os.environ.get('BULK_MAX_DEVICES', '20000'))
 bulk_lock = threading.Lock()
 bulk_in_progress = False
+
+# Batch tracking: persists in memory so user can close tab and come back
+# Key: batch_id (UUID), Value: batch state dict
+_batches = {}
+_batches_lock = threading.Lock()
 
 # Regex patterns
 MAC_PATTERN = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{4}\.){2}([0-9A-Fa-f]{4})$')
@@ -363,24 +373,13 @@ def _onboard_manual(data):
                 'device_id': device_id,
                 'device_name': device_name,
                 'ip_address': ip_address,
-                'ip_version': ip_version,
-                'ip_id': ip_id,
-                'ip_cidr': cidr,
-                'primary_field': primary_field,
-                'interface_id': interface_id,
                 'device_type': device_type_id,
                 'role': role_id,
                 'site': site_id,
-                'primary_ip_assigned': primary_ip_set,
-                'interface_error': interface_error,
-                'ip_create_error': ip_create_error,
-                'assign_error': assign_error,
                 'onboard_type': 'manual',
-                # Validation status (updated async by webhook-handler after SSH validation)
                 'reachable': None,
                 'authentication': None,
                 'management': None,
-                'validation_status': 'pending'
             }
         }, 201
 
@@ -558,20 +557,14 @@ def _onboard_dhcp(data):
                 'device_id': device_id,
                 'device_name': device_name,
                 'mac_address': mac_address,
-                'interface_mac': interface_mac,
                 'ip_address': ip_address,
-                'ip_version': ip_version,
-                'ip_id': ip_id,
-                'ip_reassigned': ip_reassigned,
-                'interface_id': interface_id,
                 'device_type': device_type_id,
                 'role': role_id,
                 'site': site_id,
-                'primary_ip_assigned': primary_ip_set,
-                'interface_error': interface_error,
-                'ip_create_error': ip_create_error,
-                'assign_error': assign_error,
-                'onboard_type': 'dhcp'
+                'onboard_type': 'dhcp',
+                'reachable': None,
+                'authentication': None,
+                'management': None,
             }
         }, 201
 
@@ -602,11 +595,10 @@ def onboard_device_dhcp():
 
 
 # =============================================================================
-# BULK ONBOARDING
+# BULK ONBOARDING (Async with batch tracking)
 # =============================================================================
 def _process_single_device(index, device_data):
     """Process a single device for bulk onboarding. Returns (index, result, status_code)."""
-    # Determine onboard type: if 'mac' is present and no 'ip', use DHCP
     has_mac = bool(device_data.get('mac', '').strip() if device_data.get('mac') else None)
     has_ip = bool(device_data.get('ip', '').strip() if device_data.get('ip') else None)
 
@@ -628,7 +620,6 @@ def _parse_csv_devices(csv_text):
             if value is None or value.strip() == '':
                 continue
             key = key.strip().lower()
-            # Convert numeric fields
             if key in ('device_type', 'role', 'site'):
                 try:
                     device[key] = int(value.strip())
@@ -641,108 +632,283 @@ def _parse_csv_devices(csv_text):
     return devices
 
 
+def _run_batch(batch_id, devices):
+    """
+    Background worker: processes all devices in a batch using thread pool.
+    Updates batch state in real-time so frontend can poll progress.
+    """
+    global bulk_in_progress
+    batch = _batches[batch_id]
+
+    try:
+        with ThreadPoolExecutor(max_workers=BULK_MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_process_single_device, i, device): i
+                for i, device in enumerate(devices)
+            }
+
+            for future in as_completed(futures):
+                try:
+                    index, result, status_code = future.result()
+                except Exception as e:
+                    index = futures[future]
+                    result = {'status': 'error', 'error': str(e)}
+                    status_code = 500
+
+                entry = dict(result)
+                entry['_index'] = index
+                entry['_status_code'] = status_code
+
+                with _batches_lock:
+                    batch['results'][index] = entry
+                    batch['processed'] += 1
+
+                    if result.get('status') == 'success':
+                        batch['successful'] += 1
+                        device_id = result.get('data', {}).get('device_id')
+                        if device_id:
+                            batch['device_ids'].append(device_id)
+                    else:
+                        batch['failed'] += 1
+
+                    batch['progress_percent'] = round(
+                        (batch['processed'] / batch['total']) * 100, 1
+                    )
+
+                    logger.info(f"[Batch {batch_id[:8]}] {batch['processed']}/{batch['total']} "
+                                f"({batch['progress_percent']}%) - "
+                                f"ok={batch['successful']} fail={batch['failed']}")
+
+        # Batch complete
+        with _batches_lock:
+            batch['status'] = 'completed'
+            batch['finished_at'] = datetime.utcnow().isoformat() + 'Z'
+            batch['elapsed_seconds'] = round(time.time() - batch['_start_time'], 2)
+
+        logger.info(f"[Batch {batch_id[:8]}] COMPLETED: {batch['successful']}/{batch['total']} "
+                     f"successful in {batch['elapsed_seconds']}s")
+
+    except Exception as e:
+        with _batches_lock:
+            batch['status'] = 'failed'
+            batch['error'] = str(e)
+            batch['finished_at'] = datetime.utcnow().isoformat() + 'Z'
+            batch['elapsed_seconds'] = round(time.time() - batch['_start_time'], 2)
+        logger.error(f"[Batch {batch_id[:8]}] FAILED: {e}")
+
+    finally:
+        bulk_in_progress = False
+        bulk_lock.release()
+
+
 @app.route('/api/onboard/bulk', methods=['POST'])
 def onboard_bulk():
     """
-    Bulk Device Onboarding - JSON array or CSV
+    Async Bulk Device Onboarding - returns batch_id immediately.
 
     Accepts:
       1. JSON: {"devices": [{...}, {...}]}
       2. CSV file upload (multipart/form-data, field name: "file")
       3. CSV text in body (Content-Type: text/csv)
 
-    Each device follows manual or DHCP onboarding rules:
-      - Has 'ip' → manual onboard
-      - Has 'mac' without 'ip' → DHCP onboard
-
-    Uses 15 parallel workers. Only one bulk operation at a time.
+    Returns 202 with batch_id. Poll GET /api/onboard/bulk/<batch_id> for progress.
     """
     global bulk_in_progress
 
     # Prevent concurrent bulk operations
     if not bulk_lock.acquire(blocking=False):
+        # Find the active batch to return its ID
+        active_batch_id = None
+        for bid, b in _batches.items():
+            if b['status'] == 'processing':
+                active_batch_id = bid
+                break
         return jsonify({
             'status': 'error',
-            'error': 'Another bulk onboarding operation is in progress'
+            'error': 'Another bulk onboarding operation is in progress',
+            'active_batch_id': active_batch_id
         }), 429
 
     try:
         bulk_in_progress = True
-        start_time = time.time()
 
-        # Parse input - JSON, CSV file upload, or CSV text
+        # Parse input
         devices = []
         content_type = request.content_type or ''
 
         if 'multipart/form-data' in content_type:
-            # CSV file upload
             file = request.files.get('file')
             if not file:
+                bulk_in_progress = False
+                bulk_lock.release()
                 return jsonify({'status': 'error', 'error': 'No file uploaded. Use field name "file"'}), 400
             csv_text = file.read().decode('utf-8')
             devices = _parse_csv_devices(csv_text)
         elif 'text/csv' in content_type:
-            # CSV text in body
             csv_text = request.get_data(as_text=True)
             devices = _parse_csv_devices(csv_text)
         else:
-            # JSON
             data = request.get_json()
             if not data:
+                bulk_in_progress = False
+                bulk_lock.release()
                 return jsonify({'status': 'error', 'error': 'Request body is empty'}), 400
             devices = data.get('devices', [])
 
         if not devices:
+            bulk_in_progress = False
+            bulk_lock.release()
             return jsonify({'status': 'error', 'error': 'No devices provided'}), 400
 
         if len(devices) > BULK_MAX_DEVICES:
+            bulk_in_progress = False
+            bulk_lock.release()
             return jsonify({
                 'status': 'error',
                 'error': f'Too many devices. Maximum is {BULK_MAX_DEVICES}, got {len(devices)}'
             }), 400
 
-        # Process devices in parallel
-        results = [{}] * len(devices)
-        successful = 0
-        failed = 0
+        # Create batch
+        batch_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat() + 'Z'
 
-        with ThreadPoolExecutor(max_workers=BULK_MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(_process_single_device, i, device): i
-                for i, device in enumerate(devices)
-            }
+        batch = {
+            'batch_id': batch_id,
+            'status': 'processing',
+            'total': len(devices),
+            'processed': 0,
+            'successful': 0,
+            'failed': 0,
+            'progress_percent': 0.0,
+            'workers': BULK_MAX_WORKERS,
+            'started_at': now,
+            'finished_at': None,
+            'elapsed_seconds': None,
+            'error': None,
+            'device_ids': [],
+            'results': [None] * len(devices),
+            '_start_time': time.time(),
+        }
 
-            for future in as_completed(futures):
-                index, result, status_code = future.result()
-                # Build clean result entry with index info
-                entry = dict(result)
-                entry['_index'] = str(index)
-                entry['_status_code'] = str(status_code)
-                results[index] = entry
+        with _batches_lock:
+            _batches[batch_id] = batch
 
-                if result.get('status') == 'success':
-                    successful += 1
-                else:
-                    failed += 1
+        # Start background processing thread
+        thread = threading.Thread(
+            target=_run_batch,
+            args=(batch_id, devices),
+            daemon=True
+        )
+        thread.start()
 
-        elapsed = round(time.time() - start_time, 2)
+        logger.info(f"[Batch {batch_id[:8]}] Started: {len(devices)} devices with {BULK_MAX_WORKERS} workers")
 
         return jsonify({
-            'status': 'completed',
+            'status': 'accepted',
+            'batch_id': batch_id,
             'total': len(devices),
-            'successful': successful,
-            'failed': failed,
-            'elapsed_seconds': elapsed,
             'workers': BULK_MAX_WORKERS,
-            'results': results
-        }), 200 if failed == 0 else 207  # 207 Multi-Status if partial failures
+            'message': f'Bulk onboarding started. Poll GET /api/onboard/bulk/{batch_id} for progress.'
+        }), 202
 
     except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
-
-    finally:
         bulk_in_progress = False
         bulk_lock.release()
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
+@app.route('/api/onboard/bulk/<batch_id>', methods=['GET'])
+def get_batch_status(batch_id):
+    """
+    Get batch progress. Frontend polls this every 2-5 seconds.
+
+    Response:
+    {
+        "batch_id": "abc-123",
+        "status": "processing" | "completed" | "failed",
+        "total": 1000,
+        "processed": 450,
+        "successful": 448,
+        "failed": 2,
+        "progress_percent": 45.0,
+        "started_at": "...",
+        "finished_at": null,
+        "elapsed_seconds": null,
+        "device_ids": [45, 46, 47, ...],
+        "results": [...]       // only included when completed or if ?results=true
+    }
+    """
+    batch = _batches.get(batch_id)
+    if not batch:
+        return jsonify({'status': 'error', 'error': 'Batch not found'}), 404
+
+    include_results = (
+        request.args.get('results', 'false').lower() == 'true'
+        or batch['status'] in ('completed', 'failed')
+    )
+
+    response = {
+        'batch_id': batch['batch_id'],
+        'status': batch['status'],
+        'total': batch['total'],
+        'processed': batch['processed'],
+        'successful': batch['successful'],
+        'failed': batch['failed'],
+        'progress_percent': batch['progress_percent'],
+        'workers': batch['workers'],
+        'started_at': batch['started_at'],
+        'finished_at': batch['finished_at'],
+        'elapsed_seconds': batch.get('elapsed_seconds') or round(time.time() - batch['_start_time'], 2),
+        'device_ids': batch['device_ids'],
+    }
+
+    if batch.get('error'):
+        response['error'] = batch['error']
+
+    if include_results:
+        response['results'] = batch['results']
+
+    return jsonify(response)
+
+
+@app.route('/api/onboard/bulk/batches', methods=['GET'])
+def list_batches():
+    """
+    List all batches (active and recent). Used when user closes tab and comes back.
+
+    Response:
+    {
+        "active": {...} or null,
+        "recent": [{...}, {...}]    // last 10 completed batches
+    }
+    """
+    active = None
+    recent = []
+
+    for batch_id, batch in _batches.items():
+        summary = {
+            'batch_id': batch['batch_id'],
+            'status': batch['status'],
+            'total': batch['total'],
+            'processed': batch['processed'],
+            'successful': batch['successful'],
+            'failed': batch['failed'],
+            'progress_percent': batch['progress_percent'],
+            'started_at': batch['started_at'],
+            'finished_at': batch['finished_at'],
+            'elapsed_seconds': batch.get('elapsed_seconds') or round(time.time() - batch['_start_time'], 2),
+        }
+
+        if batch['status'] == 'processing':
+            active = summary
+        else:
+            recent.append(summary)
+
+    # Sort recent by start time descending, keep last 10
+    recent.sort(key=lambda x: x['started_at'], reverse=True)
+    recent = recent[:10]
+
+    return jsonify({'active': active, 'recent': recent})
 
 
 # =============================================================================
@@ -846,6 +1012,296 @@ def get_sites():
     return jsonify([]), response.status_code
 
 
+@app.route('/api/devices', methods=['GET'])
+def get_all_devices():
+    """
+    Get all devices from NetBox inventory.
+    Used by frontend to display the device table/inventory page.
+
+    Query params:
+        ?limit=50      (default 50, max 1000)
+        ?offset=0      (for pagination)
+        ?role=cpe      (filter by role slug)
+        ?site=default-site  (filter by site slug)
+        ?status=active (filter by status)
+
+    Response:
+    {
+        "count": 250,
+        "devices": [
+            {
+                "id": 45,
+                "name": "192.168.1.181",
+                "ip_address": "192.168.1.181",
+                "device_type": "MaxLinear 10GE CPE",
+                "role": "CPE",
+                "site": "Default Site",
+                "status": "active",
+                "reachable": true,
+                "authentication": true,
+                "management": null
+            }, ...
+        ]
+    }
+    """
+    limit = min(int(request.args.get('limit', 50)), 1000)
+    offset = int(request.args.get('offset', 0))
+
+    params = {'limit': limit, 'offset': offset}
+    if request.args.get('role'):
+        params['role'] = request.args.get('role')
+    if request.args.get('site'):
+        params['site'] = request.args.get('site')
+    if request.args.get('status'):
+        params['status'] = request.args.get('status')
+
+    try:
+        resp = session.get(f"{NETBOX_URL}/api/dcim/devices/", params=params)
+        if resp.status_code != 200:
+            return jsonify({'error': 'Failed to fetch devices', 'details': resp.text}), resp.status_code
+
+        data = resp.json()
+        devices = []
+
+        for d in data.get('results', []):
+            cf = d.get('custom_fields', {}) or {}
+
+            # Extract IP
+            ip_address = None
+            if d.get('primary_ip4') and d['primary_ip4'].get('address'):
+                ip_address = d['primary_ip4']['address'].split('/')[0]
+
+            devices.append({
+                'id': d['id'],
+                'name': d.get('name', ''),
+                'ip_address': ip_address,
+                'device_type': d.get('device_type', {}).get('display', ''),
+                'role': d.get('role', {}).get('name', ''),
+                'site': d.get('site', {}).get('name', ''),
+                'status': d.get('status', {}).get('value', ''),
+                'reachable': cf.get('reachable'),
+                'authentication': cf.get('authentication'),
+                'management': cf.get('management'),
+            })
+
+        return jsonify({
+            'count': data.get('count', 0),
+            'devices': devices,
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/devices/<int:device_id>/credentials', methods=['PATCH'])
+def update_device_credentials(device_id):
+    """
+    Update device credentials and re-trigger SSH validation.
+
+    When the user changes username/password:
+      1. Update encrypted credentials in NetBox custom_fields
+      2. Reset reachable/authentication to null → device goes back to "pending"
+      3. The NetBox update fires an "updated" webhook
+      4. Webhook handler sees reachable=null → does NOT skip → re-validates via Server2
+      5. Frontend polls /api/devices/status to see the result
+
+    Request:  { "username": "admin", "password": "newpass123" }
+    Response: { "status": "success", "data": { "device_id": 45, "reachable": null, "authentication": null } }
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({'status': 'error', 'error': 'Request body is empty'}), 400
+
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username and not password:
+        return jsonify({'status': 'error', 'error': 'At least one of username or password is required'}), 400
+
+    try:
+        # Verify device exists
+        resp = session.get(f"{NETBOX_URL}/api/dcim/devices/{device_id}/")
+        if resp.status_code == 404:
+            return jsonify({'status': 'error', 'error': 'Device not found'}), 404
+        if resp.status_code != 200:
+            return jsonify({'status': 'error', 'error': 'Failed to fetch device', 'details': resp.text}), resp.status_code
+
+        device = resp.json()
+        existing_cf = device.get('custom_fields', {}) or {}
+
+        # Build custom_fields update: new credentials + reset validation
+        custom_fields = {
+            'reachable': None,
+            'authentication': None,
+        }
+
+        if username is not None:
+            custom_fields['username'] = username
+        if password is not None:
+            custom_fields['password'] = encrypt_password(password)
+
+        # PATCH device in NetBox
+        patch_resp = session.patch(
+            f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+            json={'custom_fields': custom_fields}
+        )
+
+        if patch_resp.status_code != 200:
+            return jsonify({'status': 'error', 'error': 'Failed to update device', 'details': patch_resp.text}), 500
+
+        logger.info(f"Credentials updated for device {device_id} ({device.get('name', '')}). "
+                    f"Validation reset to pending - webhook will re-trigger SSH validation.")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Credentials updated. SSH validation will re-run automatically.',
+            'data': {
+                'device_id': device_id,
+                'device_name': device.get('name', ''),
+                'reachable': None,
+                'authentication': None,
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
+@app.route('/api/devices/<int:device_id>/revalidate', methods=['POST'])
+def revalidate_device(device_id):
+    """
+    Re-trigger SSH validation using existing stored credentials.
+
+    Use cases:
+      - Password was changed on the physical device, user wants to verify
+      - Device was unreachable earlier, user wants to retry
+      - Routine re-check after maintenance
+
+    Resets reachable/authentication to null → NetBox webhook fires →
+    webhook handler re-validates via Server2 with the credentials already stored.
+
+    Request:  POST /api/devices/45/revalidate  (no body needed)
+    Response: { "status": "success", "data": { "device_id": 45, "reachable": null, "authentication": null } }
+    """
+    try:
+        resp = session.get(f"{NETBOX_URL}/api/dcim/devices/{device_id}/")
+        if resp.status_code == 404:
+            return jsonify({'status': 'error', 'error': 'Device not found'}), 404
+        if resp.status_code != 200:
+            return jsonify({'status': 'error', 'error': 'Failed to fetch device', 'details': resp.text}), resp.status_code
+
+        device = resp.json()
+
+        # Reset validation fields → triggers webhook → re-validates
+        patch_resp = session.patch(
+            f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+            json={'custom_fields': {'reachable': None, 'authentication': None}}
+        )
+
+        if patch_resp.status_code != 200:
+            return jsonify({'status': 'error', 'error': 'Failed to reset validation', 'details': patch_resp.text}), 500
+
+        logger.info(f"Re-validation triggered for device {device_id} ({device.get('name', '')})")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Re-validation triggered. SSH validation will re-run with existing credentials.',
+            'data': {
+                'device_id': device_id,
+                'device_name': device.get('name', ''),
+                'reachable': None,
+                'authentication': None,
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
+@app.route('/api/devices/revalidate-all', methods=['POST'])
+def revalidate_all_devices():
+    """
+    Bulk re-validate: reset reachable/authentication for ALL devices (or filtered).
+    Each reset fires a NetBox webhook → webhook handler re-validates via Server2.
+
+    Use case: detect password changes made directly on physical devices.
+
+    Optional filters in body:
+      { "role": "cpe", "site": "default-site", "device_ids": [1,2,3] }
+    No body = re-validate ALL devices.
+
+    Response: { "status": "success", "reset_count": 150, "device_ids": [...] }
+    """
+    data = request.get_json() or {}
+    filter_ids = data.get('device_ids')
+    filter_role = data.get('role')
+    filter_site = data.get('site')
+
+    try:
+        # If specific device_ids provided, use those directly
+        if filter_ids:
+            target_ids = filter_ids
+        else:
+            # Fetch all devices (paginated) with optional filters
+            target_ids = []
+            params = {'limit': 1000, 'offset': 0}
+            if filter_role:
+                params['role'] = filter_role
+            if filter_site:
+                params['site'] = filter_site
+
+            while True:
+                resp = session.get(f"{NETBOX_URL}/api/dcim/devices/", params=params)
+                if resp.status_code != 200:
+                    return jsonify({'status': 'error', 'error': 'Failed to fetch devices', 'details': resp.text}), 500
+
+                page = resp.json()
+                for d in page.get('results', []):
+                    target_ids.append(d['id'])
+
+                if not page.get('next'):
+                    break
+                params['offset'] += params['limit']
+
+        if not target_ids:
+            return jsonify({'status': 'success', 'message': 'No devices found', 'reset_count': 0}), 200
+
+        # Reset validation for each device (batched PATCHes)
+        reset_count = 0
+        failed_ids = []
+
+        for device_id in target_ids:
+            try:
+                patch_resp = session.patch(
+                    f"{NETBOX_URL}/api/dcim/devices/{device_id}/",
+                    json={'custom_fields': {'reachable': None, 'authentication': None}}
+                )
+                if patch_resp.status_code == 200:
+                    reset_count += 1
+                else:
+                    failed_ids.append(device_id)
+            except Exception:
+                failed_ids.append(device_id)
+
+        logger.info(f"Bulk re-validate: reset {reset_count}/{len(target_ids)} devices. "
+                    f"Webhooks will trigger SSH re-validation for each.")
+
+        result = {
+            'status': 'success',
+            'message': f'Re-validation triggered for {reset_count} devices. SSH checks will run automatically.',
+            'reset_count': reset_count,
+            'total_requested': len(target_ids),
+            'device_ids': target_ids,
+        }
+        if failed_ids:
+            result['failed_ids'] = failed_ids
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+
 @app.route('/api/devices/status', methods=['POST'])
 def device_status():
     """
@@ -855,11 +1311,10 @@ def device_status():
     Request:  {"device_ids": [30, 31, 29]}
     Response: {
         "devices": [
-            {"id": 30, "name": "192.168.1.171", "reachable": true, "authentication": true, "status": "validated"},
-            {"id": 31, "name": "192.168.1.172", "reachable": null, "authentication": null, "status": "pending"},
+            {"id": 30, "name": "192.168.1.171", "reachable": true, "authentication": true, "management": null},
+            {"id": 31, "name": "192.168.1.172", "reachable": null, "authentication": null, "management": null},
             ...
-        ],
-        "summary": {"total": 3, "validated": 1, "pending": 2, "unreachable": 0, "auth_failed": 0}
+        ]
     }
     """
     data = request.get_json()
@@ -869,7 +1324,6 @@ def device_status():
         return jsonify({'error': 'device_ids required'}), 400
 
     devices = []
-    summary = {'total': len(device_ids), 'validated': 0, 'pending': 0, 'unreachable': 0, 'auth_failed': 0}
 
     for device_id in device_ids:
         try:
@@ -880,38 +1334,18 @@ def device_status():
 
             device = resp.json()
             cf = device.get('custom_fields', {}) or {}
-            reachable = cf.get('reachable')
-            authentication = cf.get('authentication')
-
-            # Determine status
-            if reachable is None and authentication is None:
-                status = 'pending'
-                summary['pending'] += 1
-            elif reachable is False:
-                status = 'unreachable'
-                summary['unreachable'] += 1
-            elif reachable is True and authentication is False:
-                status = 'auth_failed'
-                summary['auth_failed'] += 1
-            elif reachable is True and authentication is True:
-                status = 'validated'
-                summary['validated'] += 1
-            else:
-                status = 'pending'
-                summary['pending'] += 1
 
             devices.append({
                 'id': device_id,
                 'name': device.get('name', ''),
-                'reachable': reachable,
-                'authentication': authentication,
+                'reachable': cf.get('reachable'),
+                'authentication': cf.get('authentication'),
                 'management': cf.get('management'),
-                'status': status
             })
         except Exception as e:
             devices.append({'id': device_id, 'error': str(e)})
 
-    return jsonify({'devices': devices, 'summary': summary})
+    return jsonify({'devices': devices})
 
 
 @app.route('/health', methods=['GET'])
@@ -935,10 +1369,15 @@ def index():
         'endpoints': {
             'POST /api/onboard': 'Manual onboarding (IP required)',
             'POST /api/onboard/dhcp': 'DHCP onboarding (MAC required)',
-            'POST /api/onboard/bulk': 'Bulk onboarding (JSON or CSV)',
+            'POST /api/onboard/bulk': 'Bulk onboarding - returns batch_id (202)',
+            'GET /api/onboard/bulk/<batch_id>': 'Get batch progress (poll every 2-5s)',
+            'GET /api/onboard/bulk/batches': 'List active + recent batches (tab recovery)',
             'POST /api/validate/ip': 'Check if IP exists',
             'POST /api/validate/mac': 'Check if MAC exists',
-            'POST /api/devices/status': 'Get validation status for device IDs (poll after bulk)',
+            'PATCH /api/devices/<id>/credentials': 'Update credentials & re-trigger SSH validation',
+            'POST /api/devices/<id>/revalidate': 'Re-trigger SSH validation for one device',
+            'POST /api/devices/revalidate-all': 'Bulk re-validate all devices (detect password changes on devices)',
+            'POST /api/devices/status': 'Get SSH validation status for device IDs',
             'GET /api/device-types': 'List device types',
             'GET /api/device-roles': 'List device roles',
             'GET /api/sites': 'List sites',

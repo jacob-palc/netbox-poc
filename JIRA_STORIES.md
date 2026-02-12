@@ -1,438 +1,275 @@
-# NetBox Device Onboarding Platform — Jira Stories
-
-## Epic: NetBox Device Onboarding & Telemetry Integration
-
-**Epic Description:** Build a complete device lifecycle management platform using NetBox as the source of truth. The system enables device onboarding via REST API, continuous reachability monitoring, SSH credential validation, and real-time telemetry notifications via webhooks.
-
----
-
-## Phase 1: Docker Infrastructure & NetBox Core
-
-### Story 1.1 — Set up Docker Compose with PostgreSQL and Redis
-
-**Type:** Story
-**Priority:** Highest
-**Story Points:** 2
-**Labels:** infrastructure, backend
-
-**Description:**
-As a platform engineer, I need the foundational database and cache services running in Docker so that NetBox has its required dependencies.
-
-**Acceptance Criteria:**
-- [ ] `docker-compose.yml` created with PostgreSQL 15 service (internal port 5432)
-- [ ] Redis 7-alpine service added (internal port 6379)
-- [ ] Health checks configured for both services
-- [ ] Environment variables defined for DB credentials (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`)
-- [ ] Shared Docker network created for inter-service communication
-- [ ] `docker-compose up -d` starts both services and they become healthy
-
----
-
-### Story 1.2 — Create custom NetBox Docker image with Paramiko
-
-**Type:** Story
-**Priority:** Highest
-**Story Points:** 2
-**Labels:** infrastructure, backend
-
-**Description:**
-As a platform engineer, I need a custom NetBox Docker image that extends the official `netboxcommunity/netbox:v4.2` image with Paramiko installed, so that SSH validation can be performed directly inside NetBox in the future.
-
-**Acceptance Criteria:**
-- [ ] `Dockerfile.netbox-custom` created extending `netboxcommunity/netbox:v4.2`
-- [ ] Paramiko installed inside the NetBox virtualenv via pip bootstrap
-- [ ] `ssh_validator.py` copied to `/opt/netbox/netbox/extras/ssh_validator.py`
-- [ ] File permissions set correctly (`chown unit:root`)
-- [ ] Original `extras/webhooks.py` is NOT overwritten (breaks RQ worker imports)
-- [ ] Image builds successfully: `docker-compose build netbox`
-
----
-
-### Story 1.3 — Add NetBox and NetBox Worker services to Docker Compose
-
-**Type:** Story
-**Priority:** Highest
-**Story Points:** 3
-**Labels:** infrastructure, backend
-
-**Description:**
-As a platform engineer, I need the NetBox application server and its background worker running in Docker so that the web UI, REST API, and asynchronous job processing (webhooks) are available.
-
-**Acceptance Criteria:**
-- [ ] NetBox service added: port 8000, built from `Dockerfile.netbox-custom`
-- [ ] NetBox Worker service added: same image, runs RQ worker (`high`, `default`, `low` queues)
-- [ ] Both depend on PostgreSQL and Redis health checks
-- [ ] Environment variables configured: `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `SECRET_KEY`, `REDIS_HOST`, `SUPERUSER_NAME`, `SUPERUSER_PASSWORD`, `SUPERUSER_API_TOKEN`, `SSH_VALIDATION_ENABLED=false`
-- [ ] NetBox UI accessible at `http://localhost:8000`
-- [ ] Admin login works with configured superuser credentials
-- [ ] Worker container is running and listening on queues (verified via `docker compose logs netbox-worker`)
-
-**Technical Notes:**
-- The worker is critical for webhook delivery. Without it, webhooks are queued in Redis but never sent.
-- `SSH_VALIDATION_ENABLED` set to `false` initially for testing.
-
----
-
-## Phase 2: NetBox Configuration via Setup Script
-
-### Story 2.1 — Create setup script with custom fields
-
-**Type:** Story
-**Priority:** High
-**Story Points:** 3
-**Labels:** backend, configuration
-
-**Description:**
-As a platform engineer, I need a Python script that configures NetBox with the required custom fields so that devices can store onboarding metadata (credentials, reachability status).
-
-**Acceptance Criteria:**
-- [ ] `setup_netbox.py` created with CLI arguments (`--netbox-url`, `--token`, `--telemetry-url`)
-- [ ] Script waits for NetBox readiness (polls `/api/` with retries)
-- [ ] 5 custom fields created on `dcim.device`:
-  - `username` (text) — SSH username
-  - `password` (text, hidden UI) — Encrypted SSH password
-  - `reachable` (boolean) — Ping reachability status
-  - `authentication` (boolean) — SSH auth result
-  - `management` (boolean) — Under management flag
-- [ ] Uses `object_types: ['dcim.device']` (NetBox v4.2 API format)
-- [ ] Idempotent: checks if custom field exists before creating
-- [ ] Script runs without errors on a fresh NetBox instance
-
----
-
-### Story 2.2 — Add manufacturers, device types, device roles, and site
-
-**Type:** Story
-**Priority:** High
-**Story Points:** 2
-**Labels:** backend, configuration
-
-**Description:**
-As a network engineer, I need predefined manufacturers, device types, device roles, and a default site configured in NetBox so that devices can be onboarded with proper categorization.
-
-**Acceptance Criteria:**
-- [ ] 3 manufacturers created: CTC Union, Edgecore, Exaware
-- [ ] 4 device types created:
-  - MaxLinear 10GE CPE (CTC Union)
-  - ECS4120-28Fv2-I (Edgecore)
-  - AS5916-54XL (Exaware)
-  - AS7315-27X (Exaware)
-- [ ] 3 device roles created: CPE, Access Switch, Router (with distinct colors)
-- [ ] 1 default site created: "Default Site" (status: active)
-- [ ] All use slug-based existence checks (idempotent)
-- [ ] Added to `setup_netbox.py` and runs as part of the setup flow
-
----
-
-### Story 2.3 — Add webhook and event rules for telemetry
-
-**Type:** Story
-**Priority:** High
-**Story Points:** 3
-**Labels:** backend, configuration, webhook
-
-**Description:**
-As a platform engineer, I need a webhook and event rules configured in NetBox so that device create/update events are automatically forwarded to the telemetry service.
-
-**Acceptance Criteria:**
-- [ ] Webhook "Device Onboarding Webhook" created:
-  - `payload_url`: configurable telemetry URL (default `http://172.27.1.70:5000/endpoint`)
-  - `http_method`: POST
-  - `http_content_type`: application/json
-  - `body_template`: empty (NetBox sends full serialized device JSON)
-  - `ssl_verification`: false (for testing)
-- [ ] Event rule "Device Onboarding Event" created: triggers on `object_created` for `dcim.device`
-- [ ] Event rule "Device Update Event" created: triggers on `object_updated` for `dcim.device`
-- [ ] Both event rules use `action_type: webhook` and point to the webhook via `action_object_id`
-- [ ] Uses `object_types` and `event_types` fields (NetBox v4.2 API — NOT `content_types`/`type_create`)
-- [ ] If webhook already exists, script PATCHes it (ensures template/URL updates are applied)
-- [ ] Verified: creating a device via NetBox UI triggers a webhook job in the worker logs
-
-**Technical Notes:**
-- `body_template` must be empty string. Custom Jinja2 templates can cause `Invalid JSON payload` errors if fields like `custom_field_data` (wrong key) are used instead of `custom_fields`.
-- Event rules use `action_object_type: extras.webhook` to link to the webhook.
-
----
-
-## Phase 3: Onboarding API Service
-
-### Story 3.1 — Create Onboarding API with manual device onboarding
-
-**Type:** Story
-**Priority:** High
-**Story Points:** 5
-**Labels:** backend, api, onboarding
-
-**Description:**
-As a network engineer, I need a REST API to onboard devices into NetBox by providing an IP address and credentials, so that device provisioning can be automated.
-
-**Acceptance Criteria:**
-- [ ] `onboarding_api.py` created as a Flask application
-- [ ] `POST /api/onboard` endpoint implemented with input fields:
-  - Required: `ip`, `device_type`, `role`, `username`, `password`
-  - Optional: `name` (defaults to IP), `site` (defaults to 1)
-- [ ] IP format validation (IPv4 and IPv6)
-- [ ] Duplicate IP check via NetBox API (`/api/ipam/ip-addresses/?address=X`)
-- [ ] Duplicate device name check
-- [ ] Password encrypted with Fernet before storing (`NETBOX_DEVICE_ENCRYPTION_KEY`)
-- [ ] Device creation flow:
-  1. Create device (`/api/dcim/devices/`) with `custom_fields: {username, password}`
-  2. Create interface `mgmt0` (`/api/dcim/interfaces/`)
-  3. Create IP address with `/32` CIDR (`/api/ipam/ip-addresses/`)
-  4. Set primary IP on device via PATCH
-- [ ] Returns JSON: `{success, device_id, message}`
-- [ ] Error handling for all NetBox API failures
-- [ ] `GET /health` endpoint returns service status
-
----
-
-### Story 3.2 — Add DHCP onboarding endpoint
-
-**Type:** Story
-**Priority:** Medium
-**Story Points:** 3
-**Labels:** backend, api, onboarding
-
-**Description:**
-As a network engineer, I need to onboard devices via MAC address (DHCP scenario) where the IP is not yet known, so that devices discovered via DHCP can be registered.
-
-**Acceptance Criteria:**
-- [ ] `POST /api/onboard/dhcp` endpoint implemented
-- [ ] Input: `mac_address`, `device_type`, `role`, `username`, `password`
-- [ ] MAC address format validation
-- [ ] Duplicate MAC check via NetBox API
-- [ ] Creates `eth0` interface with MAC address assigned
-- [ ] IP can be assigned/reassigned later via update
-- [ ] Returns JSON: `{success, device_id, message}`
-
----
-
-### Story 3.3 — Add bulk onboarding endpoint
-
-**Type:** Story
-**Priority:** Medium
-**Story Points:** 3
-**Labels:** backend, api, onboarding
-
-**Description:**
-As a network engineer, I need to onboard multiple devices in a single API call (JSON array or CSV) so that large-scale provisioning is efficient.
-
-**Acceptance Criteria:**
-- [ ] `POST /api/onboard/bulk` endpoint implemented
-- [ ] Accepts JSON array of device objects
-- [ ] Accepts CSV format (auto-detected)
-- [ ] Maximum 1000 devices per request
-- [ ] Parallel processing with `ThreadPoolExecutor(max_workers=15)`
-- [ ] Returns per-device results: `{total, successful, failed, results: [{device, success, error}]}`
-- [ ] Individual device failures do not block other devices
-
----
-
-### Story 3.4 — Add helper and validation endpoints
-
-**Type:** Story
-**Priority:** Low
-**Story Points:** 2
-**Labels:** backend, api
-
-**Description:**
-As a frontend developer, I need helper endpoints to fetch available device types, roles, and sites, and validation endpoints to check for duplicates before onboarding.
-
-**Acceptance Criteria:**
-- [ ] `GET /api/device-types` — returns list from NetBox
-- [ ] `GET /api/device-roles` — returns list from NetBox
-- [ ] `GET /api/sites` — returns list from NetBox
-- [ ] `POST /api/validate/ip` — checks if IP already exists
-- [ ] `POST /api/validate/mac` — checks if MAC already exists
-- [ ] All return clean JSON responses
-
----
-
-### Story 3.5 — Dockerize Onboarding API and add to Docker Compose
-
-**Type:** Story
-**Priority:** High
-**Story Points:** 2
-**Labels:** infrastructure, backend
-
-**Description:**
-As a platform engineer, I need the Onboarding API containerized and added to the Docker Compose stack so that it runs alongside NetBox.
-
-**Acceptance Criteria:**
-- [ ] `Dockerfile.onboarding-api` created (Python 3.11 slim, Flask, requests, cryptography)
-- [ ] Service added to `docker-compose.yml`: port 5001, depends on NetBox healthy
-- [ ] Environment variables: `NETBOX_URL=http://netbox:8000`, `NETBOX_TOKEN`, `NETBOX_DEVICE_ENCRYPTION_KEY`
-- [ ] Flask-CORS enabled for cross-origin requests
-- [ ] `curl http://localhost:5001/health` returns 200
-
----
-
-## Phase 4: Device Reachability Monitor
-
-### Story 4.1 — Create device reachability monitor service
-
-**Type:** Story
-**Priority:** Medium
-**Story Points:** 5
-**Labels:** backend, monitoring
-
-**Description:**
-As a network operations engineer, I need continuous reachability monitoring of all onboarded devices so that the `reachable` custom field is automatically updated and telemetry is notified of status changes.
-
-**Acceptance Criteria:**
-- [ ] `device_monitor.py` created as a background loop service
-- [ ] Fetches all devices with primary IP from NetBox (paginated)
-- [ ] Uses `fping` for bulk ICMP ping (1000x faster than individual pings)
-- [ ] Falls back to individual `ping` if `fping` unavailable
-- [ ] Batches devices (500 per batch) for scalable processing
-- [ ] Only updates NetBox when reachable status changes (reduces API load by 90%+)
-- [ ] Uses `asyncio + aiohttp` for concurrent NetBox API updates (max 50 concurrent)
-- [ ] Updates `custom_fields.reachable` on each device via PATCH
-- [ ] Configurable via environment variables:
-  - `PING_INTERVAL`: 60s default
-  - `PING_COUNT`: 3 packets
-  - `PING_TIMEOUT`: 2000ms
-  - `BATCH_SIZE`: 500
-  - `MAX_CONCURRENT_UPDATES`: 50
-- [ ] Performance targets:
-  - 500 devices: ~7s per cycle
-  - 5,000 devices: ~40s per cycle
-  - 20,000 devices: ~2.5min per cycle
-
----
-
-### Story 4.2 — Dockerize Device Monitor and add to Docker Compose
-
-**Type:** Story
-**Priority:** Medium
-**Story Points:** 2
-**Labels:** infrastructure, backend
-
-**Description:**
-As a platform engineer, I need the device monitor containerized and running as a background service in the Docker stack.
-
-**Acceptance Criteria:**
-- [ ] `Dockerfile.device-monitor` created (Python 3.11 slim, fping, iputils-ping, requests, aiohttp)
-- [ ] Service added to `docker-compose.yml`: no port exposed (background service)
-- [ ] Depends on NetBox healthy
-- [ ] Environment variables: `NETBOX_URL`, `NETBOX_TOKEN`, `PING_INTERVAL`, `PING_COUNT`, `PING_TIMEOUT`
-- [ ] Monitor starts and logs device ping results to stdout
-
----
-
-## Phase 5: SSH Credential Validator
-
-### Story 5.1 — Create SSH validator module for NetBox
-
-**Type:** Story
-**Priority:** Medium
-**Story Points:** 3
-**Labels:** backend, security
-
-**Description:**
-As a platform engineer, I need an SSH validation module inside NetBox that can verify device credentials via direct Paramiko SSH connection, replacing the need for an external validation service.
-
-**Acceptance Criteria:**
-- [ ] `netbox/extras/ssh_validator.py` created with:
-  - `SSHValidator` class: connects via Paramiko, runs test command
-  - `validate_device(ip, username, password)` method
-  - `validate_device_ssh(device_data)` convenience wrapper
-- [ ] Extracts IP from `data.primary_ip4.address` (strips CIDR `/32` suffix)
-- [ ] Extracts credentials from `data.custom_fields.username` and `data.custom_fields.password`
-- [ ] Decrypts Fernet-encrypted password if `NETBOX_DEVICE_ENCRYPTION_KEY` is set
-- [ ] Checks `SSH_VALIDATION_ENABLED` environment variable (skip if `false`)
-- [ ] Paramiko imported lazily inside method (not top-level) to prevent module loading failures
-- [ ] Returns `{success: bool, status_code: int, message: str}`
-- [ ] Handles errors: `AuthenticationException` (401), `SSHException` (502), generic (500)
-- [ ] Configurable: `SSH_VALIDATION_PORT`, `SSH_VALIDATION_TIMEOUT`, `SSH_VALIDATION_COMMAND`
-
----
-
-## Phase 6: End-to-End Webhook → Telemetry Integration
-
-### Story 6.1 — Verify end-to-end webhook delivery to telemetry
-
-**Type:** Story
-**Priority:** Highest
-**Story Points:** 3
-**Labels:** integration, webhook, telemetry
-
-**Description:**
-As a platform engineer, I need to verify that the complete flow works end-to-end: device onboarding triggers a webhook that reaches the external telemetry service.
-
-**Acceptance Criteria:**
-- [ ] All services started: `docker-compose up -d`
-- [ ] NetBox configured: `python3 setup_netbox.py`
-- [ ] Device onboarded via API:
-  ```
-  curl -X POST http://localhost:5001/api/onboard \
-    -H "Content-Type: application/json" \
-    -d '{"ip":"192.168.1.100","device_type":1,"role":1,"username":"admin","password":"admin123"}'
-  ```
-- [ ] Worker logs show: `Request succeeded; response status 200`
-- [ ] Telemetry service receives the webhook payload with full device data
-- [ ] Device update (e.g., reachable status change by monitor) also triggers webhook to telemetry
-
-**Verification Commands:**
-```bash
-# Watch worker process webhooks
-docker compose logs -f netbox-worker
-
-# Verify webhook configuration
-curl -s http://localhost:8000/api/extras/webhooks/ \
-  -H "Authorization: Token <TOKEN>" | python3 -m json.tool
-
-# Verify event rules
-curl -s http://localhost:8000/api/extras/event-rules/ \
-  -H "Authorization: Token <TOKEN>" | python3 -m json.tool
+# JIRA Stories - NetBox Device Onboarding & Telemetry Platform
+
+## Epic: NB-100 - NetBox Device Onboarding with SSH Validation & Telemetry Pipeline
+
+**Description:** Build an end-to-end device onboarding platform using NetBox as the source of truth. Devices are onboarded via API, validated through Server2 (SSH), and forwarded to the telemetry service for monitoring configuration generation.
+
+**Target Flow:**
+```
+Device Onboarded → NetBox Event Rule → Webhook → Webhook Handler (5002)
+    → Authenticate with Server2 (POST /api/auth/signin)
+    → Validate SSH via Server2 (POST /device)
+    → Update NetBox custom fields (reachable/authentication)
+    → Forward to Telemetry (172.27.1.70:5000/endpoint)
+    → Telemetry generates monitoring config based on device role
 ```
 
-**Definition of Done:**
-The webhook JSON payload arrives at the telemetry endpoint with all device fields including: id, name, primary_ip4, custom_fields (username, password, reachable, authentication, management), device_type, role, site, status.
-
 ---
 
-### Story 6.2 — Enable SSH validation in webhook pipeline (Future)
+## Story 1: NB-101 - Infrastructure Setup (Docker Compose)
 
-**Type:** Story
-**Priority:** Low
-**Story Points:** 5
-**Labels:** backend, security, webhook
-
-**Description:**
-As a platform engineer, I need SSH validation to gate webhook delivery so that only devices with valid SSH credentials trigger telemetry notifications.
+**As a** DevOps engineer,
+**I want** a containerized NetBox environment with all supporting services,
+**So that** the platform can be deployed consistently across environments.
 
 **Acceptance Criteria:**
-- [ ] `SSH_VALIDATION_ENABLED` set to `true` in docker-compose environment
-- [ ] SSH validation integrated into the webhook pipeline without overwriting `extras/webhooks.py`
-- [ ] On `device_created` event:
-  - SSH credentials validated via Paramiko
-  - If validation succeeds → webhook sent to telemetry
-  - If validation fails → webhook NOT sent, failure logged
-- [ ] `custom_fields.authentication` updated to `true`/`false` based on SSH result
-- [ ] On `device_updated` event → webhook sent to telemetry directly (no SSH re-validation)
+- All services start with `docker compose up -d`
+- Services are health-checked and restart on failure
+- Persistent volumes for database and media
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-101-1 | PostgreSQL service | Configure PostgreSQL 15 with `netbox` database, user, password. Add health check (`pg_isready`). Persistent volume `netbox-postgres-data`. | Done |
+| NB-101-2 | Redis service | Configure Redis 7 Alpine with AOF persistence. Add health check (`redis-cli ping`). Persistent volume `netbox-redis-data`. | Done |
+| NB-101-3 | NetBox application service | Use `netboxcommunity/netbox:v4.2` base image. Map port 8000:8080. Configure DB, Redis, secret key, superuser credentials, API token. Health check on `/login/` with 120s start period. | Done |
+| NB-101-4 | NetBox worker service | Run `rqworker` for background task processing (webhooks). Depends on NetBox healthy. Same DB/Redis/secret key config. | Done |
+| NB-101-5 | Custom NetBox Dockerfile | Create `Dockerfile.netbox-custom` extending base image. Install `paramiko` into venv for SSH validation. Copy SSH validator script. | Done |
+| NB-101-6 | Docker Compose volumes | Define named volumes: `netbox-postgres-data`, `netbox-redis-data`, `netbox-media-files`. Mount scripts directory read-only. | Done |
 
 ---
 
-## Summary Table
+## Story 2: NB-102 - NetBox Configuration & Setup Script
 
-| # | Story | Points | Priority | Phase |
-|---|-------|--------|----------|-------|
-| 1.1 | Docker Compose with PostgreSQL + Redis | 2 | Highest | 1 |
-| 1.2 | Custom NetBox Docker image | 2 | Highest | 1 |
-| 1.3 | NetBox + Worker services | 3 | Highest | 1 |
-| 2.1 | Setup script with custom fields | 3 | High | 2 |
-| 2.2 | Manufacturers, device types, roles, site | 2 | High | 2 |
-| 2.3 | Webhook + event rules for telemetry | 3 | High | 2 |
-| 3.1 | Manual device onboarding API | 5 | High | 3 |
-| 3.2 | DHCP onboarding endpoint | 3 | Medium | 3 |
-| 3.3 | Bulk onboarding endpoint | 3 | Medium | 3 |
-| 3.4 | Helper + validation endpoints | 2 | Low | 3 |
-| 3.5 | Dockerize Onboarding API | 2 | High | 3 |
-| 4.1 | Device reachability monitor | 5 | Medium | 4 |
-| 4.2 | Dockerize Device Monitor | 2 | Medium | 4 |
-| 5.1 | SSH validator module | 3 | Medium | 5 |
-| 6.1 | End-to-end webhook → telemetry verification | 3 | Highest | 6 |
-| 6.2 | Enable SSH validation in pipeline | 5 | Low | 6 |
+**As a** platform administrator,
+**I want** an automated setup script that configures NetBox with all required objects,
+**So that** the platform is ready for device onboarding without manual configuration.
 
-**Total Story Points:** 48
+**Acceptance Criteria:**
+- Single command `python setup_netbox.py` configures everything
+- Idempotent: running multiple times doesn't create duplicates
+- Cleans up stale webhooks/event rules from previous configurations
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-102-1 | Custom fields creation | Create custom fields on `dcim.device`: `username` (text), `password` (text, encrypted), `reachable` (boolean), `authentication` (boolean), `management` (boolean). Idempotent - skip if exists. | Done |
+| NB-102-2 | Manufacturer & device types | Create manufacturers (CTC Union, Generic). Create device types (MaxLinear 10GE CPE, Generic Device) linked to manufacturers. | Done |
+| NB-102-3 | Device roles | Create device roles: Router, Switch, CPE with appropriate slugs (`router`, `switch`, `cpe`). | Done |
+| NB-102-4 | Default site | Create default site for device assignment. | Done |
+| NB-102-5 | Webhook configuration | Create webhook `Device Onboarding Webhook` pointing to `http://webhook-handler:5002/webhook`. Body template with Jinja2 rendering all device fields including `id`, `slug`, `model`, `manufacturer`, `role`, `site`, `status`, `custom_fields`, `primary_ip4`. | Done |
+| NB-102-6 | Event rules | Create `Device Onboarding Event` (trigger on `object_created` for `dcim.device`) and `Device Update Event` (trigger on `object_updated`). Both fire the webhook. | Done |
+| NB-102-7 | Stale webhook/rule cleanup | Remove any old webhooks not matching the current one (e.g., old direct-to-telemetry webhooks). Remove stale event rules not in managed set. | Done |
+| NB-102-8 | Webhook body template with slugs | Include `id`, `name`, `slug` fields in role, site, device_type, manufacturer objects. Include `status.label`. Add `model: "dcim.device"` at top level. Required by telemetry Go service for role-based config generation. | Done |
+
+---
+
+## Story 3: NB-103 - Device Onboarding API
+
+**As a** network engineer,
+**I want** a REST API to onboard devices into NetBox with a single API call,
+**So that** I can quickly add devices without navigating the NetBox UI.
+
+**Acceptance Criteria:**
+- POST `/api/onboard` creates device + interface + IP + assigns primary IP in one call
+- Duplicate IP/device detection returns 409
+- Passwords are encrypted before storage
+- Immediate response includes validation status fields (pending)
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-103-1 | Flask API service | Create `onboarding_api.py` Flask service on port 5001. Add CORS. Create `Dockerfile.onboarding-api`. Add to docker-compose. | Done |
+| NB-103-2 | Manual onboarding endpoint | `POST /api/onboard` - accepts `ip`, `device_type`, `role`, `site`, `username`, `password`. Creates device, mgmt0 interface, IP address, assigns primary IP. Returns device_id. | Done |
+| NB-103-3 | IP validation & duplicate check | Validate IP format (IPv4/IPv6 via `ipaddress` module). Check if IP or device name already exists in NetBox. Return 409 with existing device details if duplicate. | Done |
+| NB-103-4 | Password encryption | Encrypt device passwords using Fernet symmetric encryption before storing in NetBox custom fields. Use `NETBOX_DEVICE_ENCRYPTION_KEY` environment variable. | Done |
+| NB-103-5 | DHCP onboarding endpoint | `POST /api/onboard/dhcp` - accepts `mac`, optional `ip`, `device_type`, `role`. MAC-based device naming. IP reassignment if existing device is down (reachable=false). | Done |
+| NB-103-6 | Validation endpoints | `POST /api/validate/ip` - check if IP exists. `POST /api/validate/mac` - check if MAC exists. Used by frontend for real-time form validation. | Done |
+| NB-103-7 | Helper endpoints | `GET /api/device-types`, `GET /api/device-roles`, `GET /api/sites` - list available options for frontend dropdowns. | Done |
+| NB-103-8 | Validation status in response | Include `reachable: null`, `authentication: null`, `management: null`, `validation_status: "pending"` in onboard response so frontend knows validation is in progress. | Done |
+| NB-103-9 | Connection pooling | Use `requests.Session` with `HTTPAdapter` for connection pooling (20 connections) to handle concurrent requests to NetBox API. | Done |
+
+---
+
+## Story 4: NB-104 - Webhook Handler (Server2 SSH Validation → Telemetry)
+
+**As a** platform operator,
+**I want** device SSH credentials validated through Server2 before telemetry is notified,
+**So that** only valid, reachable devices are monitored.
+
+**Acceptance Criteria:**
+- Webhook handler receives NetBox webhooks and orchestrates Server2 → NetBox update → Telemetry
+- Server2 SSH validation determines reachable/authentication status
+- NetBox custom fields updated with validation results
+- Telemetry receives the original NetBox webhook structure (pass-through)
+- No infinite webhook loops
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-104-1 | Flask webhook service | Create `webhook_handler.py` Flask service on port 5002. Create `Dockerfile.webhook-handler`. Add to docker-compose with Server2, telemetry, NetBox environment variables. | Done |
+| NB-104-2 | Server2 authentication | `Server2Client` class. Authenticate with Server2 via `POST /api/auth/signin` to get Bearer token. Handle token storage and refresh. | Done |
+| NB-104-3 | Server2 device validation | `POST /device` to Server2 with `ipAddress`, `username`, `password`, `licenseKey`. Parse response message to determine: reachable (true/false), authenticated (true/false). Handle "unreachable", "timeout", "auth fail" messages. Note: Server2 returns HTTP 200 even for failures - must parse message text. | Done |
+| NB-104-4 | Password decryption | Decrypt Fernet-encrypted passwords from webhook data before sending plain-text to Server2. | Done |
+| NB-104-5 | NetBox custom field update | After Server2 validation, PATCH device in NetBox to update `reachable` and `authentication` custom fields. | Done |
+| NB-104-6 | Telemetry forwarding | Forward webhook payload to telemetry service (`http://172.27.1.70:5000/endpoint`). Pass through original NetBox webhook `data` dict unchanged (preserves `slug`, `id`, nested objects). Only update `custom_fields` with validation results. Inject `primary_ip4` if missing (extracted from device name). Add `model: "dcim.device"` at top level. | Done |
+| NB-104-7 | Device info extraction | Parse webhook payload to extract: IP address (from `primary_ip4` or device name), credentials, custom fields, device type, role, site. Preserve original `raw_data` for telemetry pass-through. | Done |
+| NB-104-8 | Routing logic | Has IP + credentials → Server2 → NetBox update → Telemetry. Has IP, no credentials → Telemetry directly. No IP → Skip (device data incomplete). | Done |
+
+---
+
+## Story 5: NB-105 - Webhook Deduplication & Loop Prevention
+
+**As a** platform operator,
+**I want** the webhook handler to prevent infinite loops and redundant processing,
+**So that** each device is validated exactly once per onboarding event.
+
+**Acceptance Criteria:**
+- No infinite webhook loops when handler updates NetBox
+- Device-monitor ping updates (every 60s) don't trigger re-validation
+- Dedup window prevents rapid-fire duplicate processing
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-105-1 | Time-based deduplication | Track `_recently_processed` dict (device_id → timestamp). Skip processing if same device was handled within `DEDUP_WINDOW` (10 seconds). Prevents infinite loop: webhook handler updates NetBox → triggers "updated" webhook → caught by dedup. | Done |
+| NB-105-2 | Already-validated skip | For `updated` events: if `reachable` and `authentication` are both already set (not null), skip processing. Prevents device-monitor ping updates (every 60s) from triggering full Server2 re-validation + telemetry. | Done |
+| NB-105-3 | Re-validation support | To force re-validation, clear `reachable`/`authentication` fields in NetBox. Next webhook will see null values and re-process through Server2. | Done |
+
+---
+
+## Story 6: NB-106 - Concurrent Processing (Bulk Onboarding)
+
+**As a** network engineer,
+**I want** to onboard 1000+ devices in a single API call with parallel processing,
+**So that** bulk deployments complete in minutes instead of hours.
+
+**Acceptance Criteria:**
+- Bulk endpoint accepts JSON array or CSV file
+- 15 parallel workers for NetBox API calls
+- 15 parallel workers for Server2 SSH validations
+- Single manual onboard works during bulk operation
+- Progress tracking via polling endpoint
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-106-1 | Bulk onboarding endpoint | `POST /api/onboard/bulk` - accepts JSON `{"devices": [...]}`, CSV file upload, or CSV text body. Validates input, enforces max 1000 devices. Returns summary with per-device results. | Done |
+| NB-106-2 | Parallel device creation | `ThreadPoolExecutor` with 15 workers in onboarding API. Each worker creates device + interface + IP independently. Thread-safe with connection pooling. | Done |
+| NB-106-3 | CSV parsing | Parse CSV with headers: `ip,device_type,role,site,username,password,mac,hostname`. Auto-detect manual vs DHCP based on fields present. Convert numeric fields. | Done |
+| NB-106-4 | Webhook handler thread pool | `ThreadPoolExecutor` with 15 workers (`WEBHOOK_MAX_WORKERS`). Webhook endpoint returns 202 immediately. Heavy processing (Server2 SSH ~5s/device) runs in background threads. 1000 devices @ 5s each = ~5 min (vs ~83 min sequential). | Done |
+| NB-106-5 | Bulk lock | Only one bulk operation at a time. Return 429 if another bulk is in progress. Single manual onboards still work via the same webhook → thread pool flow. | Done |
+| NB-106-6 | Device status polling endpoint | `POST /api/devices/status` - accepts `{"device_ids": [30, 31, 32]}`. Returns per-device validation status: `pending`, `validated`, `unreachable`, `auth_failed`. Includes summary counts. Frontend polls this after bulk onboard. | Done |
+
+---
+
+## Story 7: NB-107 - Device Reachability Monitor
+
+**As a** network operator,
+**I want** continuous ping monitoring of all onboarded devices,
+**So that** I can see which devices are online/offline in real-time.
+
+**Acceptance Criteria:**
+- Pings all devices with primary IP every 60 seconds
+- Updates NetBox `reachable` field based on ping result
+- Configurable ping interval, count, and timeout
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-107-1 | Device monitor service | Create `device_monitor.py` service. Create `Dockerfile.device-monitor`. Add to docker-compose with `PING_INTERVAL: 60`, `PING_COUNT: 3`, `PING_TIMEOUT: 2`. | Done |
+| NB-107-2 | Device discovery | Query NetBox API for all devices with primary IP. Periodic refresh to pick up new devices. | Done |
+| NB-107-3 | Ping monitoring | Ping each device IP. Update `reachable` custom field in NetBox based on result. | Done |
+| NB-107-4 | Restart policy | `restart: unless-stopped` for continuous operation. Depends on NetBox healthy. | Done |
+
+---
+
+## Story 8: NB-108 - Telemetry Integration & Payload Compatibility
+
+**As a** telemetry service consumer,
+**I want** the webhook payload to match the exact NetBox webhook structure,
+**So that** the Go telemetry service can parse device role, site, and generate monitoring configs.
+
+**Acceptance Criteria:**
+- Telemetry receives payload with `data` wrapper matching original NetBox webhook format
+- Role, site, manufacturer include `id`, `name`, `slug` fields
+- Status includes `value` and `label`
+- `primary_ip4` is always populated (fallback to device name if not assigned yet)
+- Telemetry returns 200 and generates config based on device role
+
+### Subtasks
+
+| ID | Subtask | Description | Status |
+|----|---------|-------------|--------|
+| NB-108-1 | Payload structure with data wrapper | Wrap device data in `{"event": "...", "timestamp": "...", "model": "dcim.device", "data": {...}}`. The Go service reads `data.role.slug`, `data.site.name`, etc. | Done |
+| NB-108-2 | Pass-through original webhook data | Instead of reconstructing payload (losing fields), deep-copy the original `data` dict from webhook and pass through unchanged. Only update `custom_fields` with validation results. | Done |
+| NB-108-3 | Slug fields in body template | Update webhook body template to include `id` and `slug` for role, site, device_type, manufacturer. Example: `"role": {"id": 1, "name": "CPE", "slug": "cpe"}`. Required by Go telemetry service for role-based config generation. | Done |
+| NB-108-4 | IP address fallback | If `primary_ip4` is null in webhook data (IP not yet assigned when webhook fires), inject `{"address": "<ip>/32"}` using IP extracted from device name. Fixes `device IP address is required` error. | Done |
+| NB-108-5 | Role validation compatibility | Telemetry Go service requires role to be one of: `router`, `switch`, `cpe`. Ensure role slug matches these values. NetBox role slugs are auto-generated from name (lowercase, hyphenated). | Done |
+
+---
+
+## Summary - Service Architecture
+
+| Service | Port | Container | Purpose |
+|---------|------|-----------|---------|
+| PostgreSQL | - | netbox-postgres | Database |
+| Redis | - | netbox-redis | Cache & task queue |
+| NetBox | 8000 | netbox | Source of truth (UI + API) |
+| NetBox Worker | - | netbox-worker | Background webhook dispatch |
+| Onboarding API | 5001 | onboarding-api | Device creation REST API |
+| Webhook Handler | 5002 | webhook-handler | SSH validation orchestration |
+| Device Monitor | - | device-monitor | Continuous ping monitoring |
+
+## End-to-End Flow
+
+```
+1. POST /api/onboard (port 5001)
+   ├── Create device in NetBox
+   ├── Create interface (mgmt0)
+   ├── Create IP address
+   ├── Assign primary IP
+   └── Return 201 { device_id, validation_status: "pending" }
+
+2. NetBox Event Rule fires webhook
+   └── NetBox Worker sends POST to webhook-handler:5002/webhook
+
+3. Webhook Handler (port 5002)
+   ├── Extract device info from webhook payload
+   ├── Dedup check (skip if processed <10s ago)
+   ├── Already-validated check (skip if reachable & auth already set)
+   ├── Queue to ThreadPool (return 202 immediately)
+   └── Background thread:
+       ├── Authenticate with Server2 (POST /api/auth/signin)
+       ├── Validate SSH via Server2 (POST /device)
+       ├── Update NetBox (PATCH reachable/authentication)
+       └── Forward to Telemetry (POST /endpoint)
+
+4. Telemetry Go Service (172.27.1.70:5000)
+   ├── Parse device role (router/switch/cpe)
+   ├── Generate monitoring config
+   └── Reload Telegraf (SIGHUP)
+
+5. Frontend polls POST /api/devices/status (port 5001)
+   └── Returns { reachable, authentication, validation_status }
+```
+
+## Files Changed
+
+| File | Purpose |
+|------|---------|
+| `docker-compose.yml` | All service definitions, ports, env vars, volumes |
+| `Dockerfile.netbox-custom` | Custom NetBox image with paramiko |
+| `Dockerfile.webhook-handler` | Webhook handler image |
+| `Dockerfile.onboarding-api` | Onboarding API image |
+| `Dockerfile.device-monitor` | Device monitor image |
+| `setup_netbox.py` | Automated NetBox configuration (custom fields, roles, webhooks, event rules) |
+| `onboarding_api.py` | Device onboarding REST API (manual, DHCP, bulk, status polling) |
+| `webhook_handler.py` | Webhook orchestration (Server2 SSH → NetBox update → Telemetry) |
